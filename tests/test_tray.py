@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Unit tests for the tray app's pure helpers (no GTK / no `gi` needed).
+
+The GUI layer keeps all ``gi`` imports inside ``run_gui()``, so the module
+imports cleanly here and we can test the data/action helpers in isolation.
+Git-backed tests skip when git is unavailable; everything else always runs.
+"""
+import importlib.util
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+TRAY_PY = os.path.join(ROOT, "tray", "repodash_tray.py")
+HAVE_GIT = shutil.which("git") is not None
+
+
+def _load_tray():
+    spec = importlib.util.spec_from_file_location("repodash_tray", TRAY_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+tray = _load_tray()
+
+
+def _init_repo(path, origin=None):
+    subprocess.run(["git", "init", "-q", path], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", path, "config", "user.name", "t"], check=True)
+    if origin:
+        subprocess.run(["git", "-C", path, "remote", "add", "origin", origin],
+                       check=True)
+
+
+class GithubUrlTest(unittest.TestCase):
+    def test_ssh_scp_form(self):
+        self.assertEqual(
+            tray.normalize_github_url("git@github.com:owner/repo.git"),
+            "https://github.com/owner/repo")
+
+    def test_ssh_url_form(self):
+        self.assertEqual(
+            tray.normalize_github_url("ssh://git@github.com/owner/repo.git"),
+            "https://github.com/owner/repo")
+
+    def test_https_with_and_without_git_suffix(self):
+        self.assertEqual(
+            tray.normalize_github_url("https://github.com/owner/repo.git"),
+            "https://github.com/owner/repo")
+        self.assertEqual(
+            tray.normalize_github_url("https://github.com/owner/repo"),
+            "https://github.com/owner/repo")
+
+    def test_non_github_and_empty_return_none(self):
+        self.assertIsNone(tray.normalize_github_url("git@gitlab.com:o/r.git"))
+        self.assertIsNone(tray.normalize_github_url("https://example.com/x.git"))
+        self.assertIsNone(tray.normalize_github_url(""))
+        self.assertIsNone(tray.normalize_github_url(None))
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_github_url_reads_origin(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo, origin="git@github.com:acme/widget.git")
+            self.assertEqual(tray.github_url(repo),
+                             "https://github.com/acme/widget")
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_github_url_none_without_remote(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            self.assertIsNone(tray.github_url(repo))
+
+
+class TerminalArgvTest(unittest.TestCase):
+    def test_ptyxis(self):
+        self.assertEqual(tray.terminal_argv("ptyxis", "/x"),
+                         ["ptyxis", "--new-window", "-d", "/x"])
+        self.assertEqual(
+            tray.terminal_argv("ptyxis", "/x", "claude"),
+            ["ptyxis", "--new-window", "-d", "/x", "--",
+             "bash", "-lc", "claude; exec bash"])
+
+    def test_gnome_terminal(self):
+        self.assertEqual(tray.terminal_argv("gnome-terminal", "/x"),
+                         ["gnome-terminal", "--working-directory=/x"])
+        argv = tray.terminal_argv("gnome-terminal", "/x", "claude")
+        self.assertEqual(argv[:2], ["gnome-terminal", "--working-directory=/x"])
+        self.assertIn("claude; exec bash", argv)
+
+    def test_kgx_and_ghostty_and_xterm(self):
+        self.assertEqual(tray.terminal_argv("kgx", "/x")[:1], ["kgx"])
+        self.assertIn("claude; exec bash",
+                      " ".join(tray.terminal_argv("kgx", "/x", "claude")))
+        self.assertEqual(tray.terminal_argv("ghostty", "/x"),
+                         ["ghostty", "--working-directory=/x"])
+        self.assertEqual(tray.terminal_argv("xterm", "/x"), ["xterm"])
+
+    def test_absolute_path_uses_basename_dialect(self):
+        self.assertEqual(
+            tray.terminal_argv("/usr/bin/ptyxis", "/x"),
+            ["/usr/bin/ptyxis", "--new-window", "-d", "/x"])
+
+    def test_unknown_terminal_raises(self):
+        with self.assertRaises(ValueError):
+            tray.terminal_argv("nonsuch", "/x")
+
+
+class DetectTerminalTest(unittest.TestCase):
+    def setUp(self):
+        self._saved = os.environ.get("REPODASH_TERMINAL")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("REPODASH_TERMINAL", None)
+        else:
+            os.environ["REPODASH_TERMINAL"] = self._saved
+
+    def test_override_present_on_path(self):
+        os.environ["REPODASH_TERMINAL"] = "sh"  # always on PATH
+        self.assertEqual(tray.detect_terminal(), "sh")
+
+    def test_override_missing_returns_none(self):
+        os.environ["REPODASH_TERMINAL"] = "definitely-not-a-real-terminal-xyz"
+        self.assertIsNone(tray.detect_terminal())
+
+
+class PushActionTest(unittest.TestCase):
+    def test_open_push_uses_git_push_in_terminal(self):
+        # With a forced terminal, open_push should build a keep-open `git push`.
+        saved = os.environ.get("REPODASH_TERMINAL")
+        os.environ["REPODASH_TERMINAL"] = "ptyxis"
+        try:
+            argv = tray.terminal_argv("ptyxis", "/x", "git push")
+            self.assertIn("git push; exec bash", argv)
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_TERMINAL", None)
+            else:
+                os.environ["REPODASH_TERMINAL"] = saved
+
+
+class AutostartTest(unittest.TestCase):
+    def setUp(self):
+        self._home = os.environ.get("HOME")
+        self._xdg = os.environ.get("XDG_CONFIG_HOME")
+        self._tmp = tempfile.mkdtemp(prefix="repodash-autostart-")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp
+
+    def tearDown(self):
+        if self._xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._xdg
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_enable_then_disable(self):
+        self.assertFalse(tray.autostart_enabled())
+        self.assertTrue(tray.set_autostart(True))
+        self.assertTrue(tray.autostart_enabled())
+        self.assertTrue(os.path.isfile(tray.autostart_file()))
+
+        with open(tray.autostart_file()) as f:
+            content = f.read()
+        self.assertIn("repodash_tray.py", content)
+        self.assertIn("X-GNOME-Autostart-enabled=true", content)
+
+        self.assertFalse(tray.set_autostart(False))
+        self.assertFalse(tray.autostart_enabled())
+
+    def test_disable_when_absent_is_noop(self):
+        self.assertFalse(tray.set_autostart(False))  # no exception
+
+
+class ConfigTest(unittest.TestCase):
+    def setUp(self):
+        self._xdg = os.environ.get("XDG_CONFIG_HOME")
+        self._tmp = tempfile.mkdtemp(prefix="repodash-config-")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp
+
+    def tearDown(self):
+        if self._xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._xdg
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_load_defaults_when_missing(self):
+        cfg = tray.load_config()
+        self.assertEqual(cfg["base_dir"], "")
+        self.assertEqual(cfg["depth"], 0)
+        self.assertEqual(cfg["refresh_interval"], 0)
+        self.assertEqual(cfg["excluded_repos"], [])
+        self.assertEqual(cfg["terminal"], "")
+
+    def test_roundtrip_save_load(self):
+        cfg = tray.load_config()
+        cfg["base_dir"] = "/some/path"
+        cfg["depth"] = 4
+        cfg["refresh_interval"] = 120
+        cfg["terminal"] = "xterm"
+        tray.save_config(cfg)
+        loaded = tray.load_config()
+        self.assertEqual(loaded["base_dir"], "/some/path")
+        self.assertEqual(loaded["depth"], 4)
+        self.assertEqual(loaded["refresh_interval"], 120)
+        self.assertEqual(loaded["terminal"], "xterm")
+
+    def test_excluded_repos_survives_roundtrip(self):
+        cfg = tray.load_config()
+        cfg["excluded_repos"] = ["/repo/a", "/repo/b"]
+        tray.save_config(cfg)
+        loaded = tray.load_config()
+        self.assertEqual(sorted(loaded["excluded_repos"]), ["/repo/a", "/repo/b"])
+
+    def test_corrupt_config_returns_defaults(self):
+        path = tray.config_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{not valid json")
+        cfg = tray.load_config()
+        self.assertEqual(cfg["depth"], 0)
+
+    def test_resolve_depth_uses_env_when_zero(self):
+        saved = os.environ.get("REPODASH_DEPTH")
+        os.environ["REPODASH_DEPTH"] = "7"
+        try:
+            self.assertEqual(tray.resolve_depth({"depth": 0}), 7)
+            self.assertEqual(tray.resolve_depth({"depth": 5}), 5)
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_DEPTH", None)
+            else:
+                os.environ["REPODASH_DEPTH"] = saved
+
+    def test_resolve_interval_uses_env_when_zero(self):
+        saved = os.environ.get("REPODASH_TRAY_INTERVAL")
+        os.environ["REPODASH_TRAY_INTERVAL"] = "60"
+        try:
+            self.assertEqual(tray.resolve_interval({"refresh_interval": 0}), 60)
+            self.assertEqual(tray.resolve_interval({"refresh_interval": 300}), 300)
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_TRAY_INTERVAL", None)
+            else:
+                os.environ["REPODASH_TRAY_INTERVAL"] = saved
+
+    def test_resolve_base_dir_uses_env_when_empty(self):
+        saved = os.environ.get("REPODASH_DIR")
+        os.environ["REPODASH_DIR"] = "/env/repos"
+        try:
+            self.assertEqual(tray.resolve_base_dir({"base_dir": ""}), "/env/repos")
+            self.assertEqual(tray.resolve_base_dir({"base_dir": "/cfg/repos"}),
+                             "/cfg/repos")
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_DIR", None)
+            else:
+                os.environ["REPODASH_DIR"] = saved
+
+    def _save_env(self, *keys):
+        return {k: os.environ.get(k) for k in keys}
+
+    def _restore_env(self, saved):
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_apply_config_sets_terminal(self):
+        saved = self._save_env("REPODASH_TERMINAL")
+        os.environ.pop("REPODASH_TERMINAL", None)
+        try:
+            tray.apply_config_to_env({"terminal": "xterm", "base_dir": "",
+                                      "depth": 0, "refresh_interval": 0})
+            self.assertEqual(os.environ.get("REPODASH_TERMINAL"), "xterm")
+        finally:
+            self._restore_env(saved)
+
+    def test_apply_config_clears_terminal_when_blank(self):
+        saved = self._save_env("REPODASH_TERMINAL")
+        os.environ["REPODASH_TERMINAL"] = "ghostty"
+        try:
+            tray.apply_config_to_env({"terminal": "", "base_dir": "",
+                                      "depth": 0, "refresh_interval": 0})
+            self.assertNotIn("REPODASH_TERMINAL", os.environ)
+        finally:
+            self._restore_env(saved)
+
+    def test_apply_config_sets_base_dir_and_depth(self):
+        saved = self._save_env("REPODASH_DIR", "REPODASH_DEPTH")
+        try:
+            tray.apply_config_to_env({"base_dir": "/tmp/repos", "depth": 4,
+                                      "refresh_interval": 0, "terminal": ""})
+            self.assertEqual(os.environ.get("REPODASH_DIR"), "/tmp/repos")
+            self.assertEqual(os.environ.get("REPODASH_DEPTH"), "4")
+        finally:
+            self._restore_env(saved)
+
+    def test_apply_config_zero_depth_leaves_env_untouched(self):
+        saved = self._save_env("REPODASH_DEPTH")
+        os.environ["REPODASH_DEPTH"] = "5"
+        try:
+            tray.apply_config_to_env({"base_dir": "", "depth": 0,
+                                      "refresh_interval": 0, "terminal": ""})
+            self.assertEqual(os.environ.get("REPODASH_DEPTH"), "5")
+        finally:
+            self._restore_env(saved)
+
+
+class DiscoveryTest(unittest.TestCase):
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_find_repos_and_dirty_state(self):
+        with tempfile.TemporaryDirectory() as base:
+            clean = os.path.join(base, "clean")
+            dirty = os.path.join(base, "dirty")
+            _init_repo(clean)
+            _init_repo(dirty)
+            # leave `clean` empty (no changes), make `dirty` dirty
+            with open(os.path.join(dirty, "new.txt"), "w") as f:
+                f.write("hi")
+
+            repos = tray.find_repos(base, depth=2)
+            self.assertEqual({os.path.basename(r) for r in repos},
+                             {"clean", "dirty"})
+
+            states = {s["name"]: s for s in tray.scan_dirty(base, depth=2)}
+            self.assertFalse(states["clean"]["dirty"])
+            self.assertTrue(states["dirty"]["dirty"])
+            self.assertEqual(states["dirty"]["count"], 1)
+
+    def test_find_repos_missing_base_is_empty(self):
+        self.assertEqual(tray.find_repos("/no/such/path/xyz", depth=2), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

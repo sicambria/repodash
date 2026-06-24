@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=repodash
+GenericName=Repo Dashboard
+Comment=Multi-repo git status dashboard with GNOME tray icon
+# Use an ABSOLUTE path — set by tray/setup.sh --menu.
+# Edit this to where you cloned repodash, e.g. /home/you/git/repodash/tray/repodash_tray.py
+Exec=/usr/bin/python3 %h/git/repodash/tray/repodash_tray.py
+Icon=repodash
+Terminal=false
+Categories=Development;Utility;
+Keywords=git;repository;status;dashboard;tray;
+StartupNotify=false

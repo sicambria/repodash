@@ -1,0 +1,1021 @@
+#!/usr/bin/env python3
+# repodash — GNOME tray icon + dashboard window (Linux / GTK3 only).
+# Copyright (C) 2026 repodash contributors. GPL-3.0-or-later.
+"""A system-tray companion for repodash.
+
+This is a *consumer* of the cross-platform core: it never imports or modifies
+``repodash.py`` / ``repodash``. The tray menu does its own cheap ``git status``
+probe per repo (so it can refresh often without walking every tree), and only
+shells out to ``repodash.py --json`` for the full model when the dashboard
+window is opened or refreshed.
+
+Two surfaces:
+  * a tray indicator whose menu lists only repos with a dirty working tree, each
+    with quick actions (terminal, Claude Code, GitHub, folder, copy path);
+  * a larger dashboard window listing every repo's status with search/filter.
+
+Run ``repodash_tray.py --check`` for a headless dump of what the tray sees
+(no GTK required) — useful for verification over SSH.
+
+GTK3 is mandatory because AyatanaAppIndicator3 has no GTK4 binding, and a process
+cannot load both GTK3 and GTK4. All ``gi`` imports therefore live inside the GUI
+layer so the pure helpers below import cleanly anywhere (and in the test suite).
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# ── configuration ────────────────────────────────────────────────────────────
+DEFAULT_DEPTH = 3
+DEFAULT_INTERVAL = 90  # seconds between cheap menu refreshes
+CLAUDE_COMMAND = "claude --dangerously-skip-permissions"
+# Preference order; first one found on PATH wins unless REPODASH_TERMINAL is set.
+TERMINAL_PREFERENCE = ("ptyxis", "gnome-terminal", "kgx", "ghostty", "xterm")
+
+_AHEAD_RE = re.compile(r"ahead (\d+)")
+_BEHIND_RE = re.compile(r"behind (\d+)")
+
+CONFIG_DEFAULTS = {
+    "base_dir": "",
+    "depth": 0,
+    "refresh_interval": 0,
+    "excluded_repos": [],
+    "terminal": "",
+}
+
+
+def base_dir() -> str:
+    """Scan root, matching the core: $REPODASH_DIR, else ~/git."""
+    return os.environ.get("REPODASH_DIR") or os.path.join(
+        os.path.expanduser("~"), "git")
+
+
+def scan_depth() -> int:
+    try:
+        return int(os.environ.get("REPODASH_DEPTH", str(DEFAULT_DEPTH)))
+    except ValueError:
+        return DEFAULT_DEPTH
+
+
+def refresh_interval() -> int:
+    try:
+        return max(5, int(os.environ.get("REPODASH_TRAY_INTERVAL",
+                                         str(DEFAULT_INTERVAL))))
+    except ValueError:
+        return DEFAULT_INTERVAL
+
+
+def config_file() -> str:
+    """Path of the per-user config file (honors $XDG_CONFIG_HOME)."""
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(config, "repodash", "config.json")
+
+
+def load_config() -> dict:
+    """Load config from disk, merged with defaults. Never raises."""
+    import json
+    cfg = dict(CONFIG_DEFAULTS)
+    cfg["excluded_repos"] = list(CONFIG_DEFAULTS["excluded_repos"])
+    try:
+        with open(config_file(), "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            for key in CONFIG_DEFAULTS:
+                if key in saved:
+                    cfg[key] = saved[key]
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    """Write config to disk. Never raises."""
+    import json
+    path = config_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+def resolve_base_dir(cfg: dict) -> str:
+    return cfg.get("base_dir") or base_dir()
+
+
+def resolve_depth(cfg: dict) -> int:
+    d = cfg.get("depth", 0)
+    return int(d) if d and int(d) > 0 else scan_depth()
+
+
+def resolve_interval(cfg: dict) -> int:
+    i = cfg.get("refresh_interval", 0)
+    return max(5, int(i)) if i and int(i) > 0 else refresh_interval()
+
+
+def apply_config_to_env(cfg: dict) -> None:
+    """Push config values into os.environ so helpers and subprocesses pick them up.
+
+    fetch_model() shells out to repodash.py --json, which reads REPODASH_DIR /
+    REPODASH_DEPTH from the environment. detect_terminal() reads REPODASH_TERMINAL.
+    Calling this after load_config() and after every save ensures they stay in sync.
+    """
+    if cfg.get("base_dir"):
+        os.environ["REPODASH_DIR"] = cfg["base_dir"]
+    depth = cfg.get("depth", 0)
+    if depth and int(depth) > 0:
+        os.environ["REPODASH_DEPTH"] = str(int(depth))
+    interval = cfg.get("refresh_interval", 0)
+    if interval and int(interval) > 0:
+        os.environ["REPODASH_TRAY_INTERVAL"] = str(int(interval))
+    terminal = cfg.get("terminal", "").strip()
+    if terminal:
+        os.environ["REPODASH_TERMINAL"] = terminal
+    else:
+        os.environ.pop("REPODASH_TERMINAL", None)
+
+
+# ── git helpers (cheap menu tier) ────────────────────────────────────────────
+def _git(repo: str, *args: str) -> str:
+    """Run git in *repo*; stdout on success, empty string on any failure.
+
+    Mirrors the defensive style of ``_git`` in repodash.py.
+    """
+    try:
+        out = subprocess.run(["git", "-C", repo, *args],
+                             capture_output=True, text=True, timeout=15)
+        return out.stdout if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def find_repos(base=None, depth=None):
+    """Directories containing a ``.git`` dir, under *base*, to *depth*.
+
+    Same discovery contract as ``find_repos`` in repodash.py: do not descend
+    into a repo's own subdirectories, and stop at the depth limit.
+    """
+    base = os.path.abspath(base if base is not None else base_dir())
+    depth = scan_depth() if depth is None else depth
+    repos = []
+    if not os.path.isdir(base):
+        return repos
+    base_level = base.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, _ in os.walk(base):
+        level = dirpath.count(os.sep) - base_level
+        if os.path.isdir(os.path.join(dirpath, ".git")):
+            repos.append(dirpath)
+            dirnames[:] = []
+            continue
+        if level >= depth:
+            dirnames[:] = []
+    return sorted(repos)
+
+
+def git_status(repo: str) -> dict:
+    """Cheap working-tree status for one repo (no filesystem walk).
+
+    Returns branch/ahead/behind/dirty/count without building the full model.
+    """
+    out = _git(repo, "status", "--porcelain", "-b")
+    lines = out.splitlines()
+    header = lines[0] if lines and lines[0].startswith("## ") else ""
+    files = [ln for ln in lines[1:] if ln.strip()]
+
+    branch = ""
+    if header:
+        rest = header[3:]
+        for prefix in ("No commits yet on ", "Initial commit on "):
+            if rest.startswith(prefix):
+                rest = rest[len(prefix):]
+                break
+        branch = rest.split("...")[0].split(" ")[0]
+
+    ahead = int(_AHEAD_RE.search(header).group(1)) if _AHEAD_RE.search(header) else 0
+    behind = int(_BEHIND_RE.search(header).group(1)) if _BEHIND_RE.search(header) else 0
+
+    return {
+        "path": os.path.abspath(repo),
+        "name": os.path.basename(repo.rstrip(os.sep)),
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": bool(files),
+        "count": len(files),
+    }
+
+
+def scan_dirty(base=None, depth=None):
+    """All repos' cheap status, sorted by name. Used by the menu and --check."""
+    return [git_status(r) for r in find_repos(base, depth)]
+
+
+# ── GitHub URL resolution ────────────────────────────────────────────────────
+_GH_SSH_RE = re.compile(r"^git@github\.com:(?P<path>.+?)(?:\.git)?$")
+_GH_SCP_SSH_RE = re.compile(r"^ssh://git@github\.com/(?P<path>.+?)(?:\.git)?$")
+_GH_HTTPS_RE = re.compile(r"^https://github\.com/(?P<path>.+?)(?:\.git)?$")
+
+
+def normalize_github_url(remote: str):
+    """Canonical ``https://github.com/owner/repo`` from a remote, else None.
+
+    Handles ``git@github.com:owner/repo.git``, ``ssh://git@github.com/...`` and
+    ``https://github.com/owner/repo(.git)``. Non-GitHub remotes return None.
+    """
+    if not remote:
+        return None
+    remote = remote.strip()
+    for rx in (_GH_SSH_RE, _GH_SCP_SSH_RE, _GH_HTTPS_RE):
+        m = rx.match(remote)
+        if m:
+            return "https://github.com/" + m.group("path").rstrip("/")
+    return None
+
+
+def github_url(repo: str):
+    """GitHub web URL for *repo*'s origin remote, or None."""
+    return normalize_github_url(_git(repo, "remote", "get-url", "origin").strip())
+
+
+# ── terminal launching ───────────────────────────────────────────────────────
+def detect_terminal():
+    """Resolved terminal command, honoring $REPODASH_TERMINAL, else preference.
+
+    Returns the executable name (already confirmed on PATH) or None.
+    """
+    override = os.environ.get("REPODASH_TERMINAL")
+    if override:
+        exe = shutil.which(override) or (override if os.path.isabs(override) else None)
+        return override if exe else None
+    for term in TERMINAL_PREFERENCE:
+        if shutil.which(term):
+            return term
+    return None
+
+
+def _keep_open(command: str) -> str:
+    # Run under a login shell, then drop into an interactive shell so the window
+    # stays open after the command exits. A login shell is also the right context
+    # for `claude` (it warns/refuses in bare non-interactive shells).
+    return f"{command}; exec bash"
+
+
+def terminal_argv(term: str, cwd: str, command=None):
+    """argv list to open *term* in *cwd*, optionally running *command*.
+
+    Raises ValueError for an unknown terminal. The basename of *term* selects
+    the flag dialect, so absolute paths in $REPODASH_TERMINAL still work.
+    """
+    name = os.path.basename(term)
+    if name == "ptyxis":
+        argv = [term, "--new-window", "-d", cwd]
+        if command:
+            argv += ["--", "bash", "-lc", _keep_open(command)]
+        return argv
+    if name == "gnome-terminal":
+        argv = [term, f"--working-directory={cwd}"]
+        if command:
+            argv += ["--", "bash", "-lc", _keep_open(command)]
+        return argv
+    if name == "kgx":  # GNOME Console
+        argv = [term, "--working-directory", cwd]
+        if command:
+            argv += ["-e", f"bash -lc '{_keep_open(command)}'"]
+        return argv
+    if name == "ghostty":
+        argv = [term, f"--working-directory={cwd}"]
+        if command:
+            argv += ["-e", "bash", "-lc", _keep_open(command)]
+        return argv
+    if name == "xterm":
+        argv = [term]
+        if command:
+            argv += ["-e", "bash", "-lc", _keep_open(command)]
+        # xterm has no portable cwd flag; the spawn sets cwd via Popen instead.
+        return argv
+    raise ValueError(f"unsupported terminal: {term}")
+
+
+# ── action layer (returns (ok, message); never raises) ───────────────────────
+def _spawn(argv, cwd=None):
+    try:
+        subprocess.Popen(argv, cwd=cwd,
+                         stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True, None
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def open_terminal(path: str, command=None):
+    term = detect_terminal()
+    if not term:
+        return False, "no terminal found (set REPODASH_TERMINAL)"
+    # xterm needs cwd from Popen; others embed it in argv. Passing cwd is
+    # harmless for the rest, so always pass it.
+    return _spawn(terminal_argv(term, path, command), cwd=path)
+
+
+def open_claude(path: str):
+    return open_terminal(path, CLAUDE_COMMAND)
+
+
+def open_url(url: str):
+    if not url:
+        return False, "no URL"
+    return _spawn(["xdg-open", url])
+
+
+def open_github(path: str):
+    url = github_url(path)
+    if not url:
+        return False, "no GitHub remote"
+    return open_url(url)
+
+
+def open_folder(path: str):
+    return _spawn(["xdg-open", path])
+
+
+def open_push(path: str):
+    # Run `git push` in a terminal rather than silently in the background: a
+    # push can prompt for credentials / an ssh passphrase and can fail, and the
+    # user must see that. The keep-open shell leaves the result on screen.
+    return open_terminal(path, "git push")
+
+
+# ── autostart (configurable from the menu) ───────────────────────────────────
+_AUTOSTART_NAME = "repodash-tray.desktop"
+
+
+def autostart_file() -> str:
+    """Path of the per-user autostart entry (honors $XDG_CONFIG_HOME)."""
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(config, "autostart", _AUTOSTART_NAME)
+
+
+def autostart_enabled() -> bool:
+    return os.path.isfile(autostart_file())
+
+
+def _autostart_contents() -> str:
+    # Absolute interpreter + script path: autostart runs with a minimal PATH.
+    exe = sys.executable or "/usr/bin/python3"
+    script = os.path.abspath(__file__)
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=repodash tray\n"
+        "Comment=Tray icon for the repodash multi-repo dashboard\n"
+        f"Exec={exe} {script}\n"
+        "Icon=utilities-terminal\n"
+        "Terminal=false\n"
+        "Categories=Development;Utility;\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "X-GNOME-Autostart-Delay=3\n"
+    )
+
+
+def set_autostart(enabled: bool) -> bool:
+    """Enable/disable login autostart by writing/removing the .desktop entry."""
+    path = autostart_file()
+    if enabled:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(_autostart_contents())
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    return autostart_enabled()
+
+
+# ── full model (dashboard tier) ──────────────────────────────────────────────
+def _core_script() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "repodash.py")
+
+
+def fetch_model() -> dict:
+    """Run ``repodash.py --json`` and parse it. Never raises.
+
+    On any failure returns ``{"error": "...", "repos": []}`` so callers can
+    render the problem instead of crashing.
+    """
+    import json
+    script = _core_script()
+    if not os.path.isfile(script):
+        return {"error": f"core not found: {script}", "repos": []}
+    try:
+        out = subprocess.run([sys.executable, script, "--json"],
+                             capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"error": str(e), "repos": []}
+    if out.returncode != 0:
+        return {"error": out.stderr.strip() or f"exit {out.returncode}",
+                "repos": []}
+    try:
+        return json.loads(out.stdout)
+    except ValueError as e:
+        return {"error": f"bad JSON from core: {e}", "repos": []}
+
+
+# ── headless self-check ──────────────────────────────────────────────────────
+def run_check() -> int:
+    """Print what the tray sees, without starting GTK. Returns an exit code."""
+    cfg = load_config()
+    cfile = config_file()
+    cfg_status = "found" if os.path.isfile(cfile) else "not found (using defaults)"
+    print(f"config    : {cfile}  [{cfg_status}]")
+
+    base = resolve_base_dir(cfg)
+    depth = resolve_depth(cfg)
+    interval = resolve_interval(cfg)
+    excluded = set(cfg.get("excluded_repos", []))
+    print(f"scan root : {base}  (depth {depth}, interval {interval}s)")
+    if excluded:
+        print(f"excluded  : {len(excluded)} repo(s)")
+        for p in sorted(excluded):
+            print(f"  - {p}")
+
+    term = detect_terminal()
+    print(f"terminal  : {term or '(none found — set REPODASH_TERMINAL)'}")
+    if term:
+        print("  terminal argv  :", terminal_argv(term, base))
+        print("  claude argv    :", terminal_argv(term, base, CLAUDE_COMMAND))
+    print(f"autostart : {'on' if autostart_enabled() else 'off'}  "
+          f"({autostart_file()})")
+
+    repos = scan_dirty(base, depth)
+    repos = [r for r in repos if r["path"] not in excluded]
+    dirty = [r for r in repos if r["dirty"]]
+    print(f"\nrepos     : {len(repos)} found, {len(dirty)} dirty")
+    for r in dirty:
+        track = ""
+        if r["ahead"] or r["behind"]:
+            track = f"  ↑{r['ahead']} ↓{r['behind']}"
+        gh = github_url(r["path"])
+        print(f"  • {r['name']}  [{r['branch']}{track}]  "
+              f"{r['count']} file(s)" + (f"  {gh}" if gh else ""))
+    return 0
+
+
+# ── GUI layer (GTK3) ─────────────────────────────────────────────────────────
+def run_gui() -> int:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator
+    except (ValueError, ImportError):
+        try:
+            gi.require_version("AppIndicator3", "0.1")
+            from gi.repository import AppIndicator3 as AppIndicator
+        except (ValueError, ImportError):
+            sys.stderr.write(
+                "error: no AppIndicator typelib found. Install "
+                "gir1.2-ayatanaappindicator3-0.1 (see tray/README.md).\n")
+            return 1
+    from gi.repository import Gtk, GLib, Gdk
+    import threading
+
+    APP_ID = "org.repodash.Tray"
+    ICON_SVG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "repodash.svg")
+    FALLBACK_ICON = "utilities-terminal"
+
+    def warn_if_no_indicator_extension():
+        if not shutil.which("gnome-extensions"):
+            return
+        try:
+            out = subprocess.run(["gnome-extensions", "list", "--enabled"],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return
+        if "appindicator" not in out.stdout.lower():
+            sys.stderr.write(
+                "warning: no AppIndicator GNOME extension enabled — the tray "
+                "icon may not appear. Enable 'Ubuntu AppIndicators'.\n")
+
+    def notify(parent, ok, message):
+        """Surface an action failure; success is silent."""
+        if ok:
+            return
+        dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK,
+                                text="Action failed")
+        dlg.format_secondary_text(message or "unknown error")
+        dlg.run()
+        dlg.destroy()
+
+    class TrayApp(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id=APP_ID)
+            self.indicator = None
+            self.window = None
+            self.repos = []          # cheap status list (menu tier)
+            self.model = None        # full model (dashboard tier), lazy
+            self._timer_id = 0
+            self.config = load_config()
+            apply_config_to_env(self.config)
+
+        # -- lifecycle --
+        def do_startup(self):
+            Gtk.Application.do_startup(self)
+            self.hold()  # stay alive without a window (tray-resident)
+            self._first_activate = True
+            warn_if_no_indicator_extension()
+            # libappindicator resolves icons by *name* within a theme path more
+            # reliably than by absolute file path; register tray/ as a theme dir
+            # and reference "repodash" (→ repodash.svg). Fall back to a stock
+            # theme icon if our SVG is missing.
+            have_icon = os.path.isfile(ICON_SVG)
+            icon_name = "repodash" if have_icon else FALLBACK_ICON
+            self.indicator = AppIndicator.Indicator.new(
+                "repodash-tray", icon_name,
+                AppIndicator.IndicatorCategory.APPLICATION_STATUS)
+            if have_icon:
+                self.indicator.set_icon_theme_path(
+                    os.path.dirname(os.path.abspath(__file__)))
+            self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            self.indicator.set_title("repodash")
+            self.indicator.set_menu(self._build_menu())
+            self.refresh_menu()
+            self._timer_id = GLib.timeout_add_seconds(
+                resolve_interval(self.config), self._on_timer)
+
+        def do_activate(self):
+            # GtkApplication fires `activate` on the primary instance at normal
+            # startup too — stay quietly tray-resident on first launch, and only
+            # surface the dashboard on a genuine re-activation (second launch).
+            if self._first_activate:
+                self._first_activate = False
+                return
+            self.show_dashboard()
+
+        def _on_timer(self):
+            self.refresh_menu()
+            return True  # keep ticking
+
+        # -- menu tier --
+        def refresh_menu(self):
+            cfg = self.config
+
+            def work():
+                base = resolve_base_dir(cfg)
+                depth = resolve_depth(cfg)
+                excluded = set(cfg.get("excluded_repos", []))
+                repos = scan_dirty(base, depth)
+                repos = [r for r in repos if r["path"] not in excluded]
+                # Resolve GitHub URLs off the main thread so menu-building
+                # (which runs on the GTK thread) never blocks on git.
+                for r in repos:
+                    if r["dirty"]:
+                        r["github"] = github_url(r["path"])
+                GLib.idle_add(self._apply_repos, repos)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _apply_repos(self, repos):
+            self.repos = repos
+            self.indicator.set_menu(self._build_menu())
+            dirty = sum(1 for r in repos if r["dirty"])
+            self.indicator.set_label(str(dirty) if dirty else "", "")
+            return False
+
+        def _build_menu(self):
+            menu = Gtk.Menu()
+            dirty = [r for r in self.repos if r["dirty"]]
+            header = Gtk.MenuItem(
+                label=f"{len(dirty)} dirty · {len(self.repos)} repos")
+            header.set_sensitive(False)
+            menu.append(header)
+            menu.append(Gtk.SeparatorMenuItem())
+
+            for r in dirty:
+                menu.append(self._repo_item(r))
+            if not dirty:
+                clean = Gtk.MenuItem(label="✓ all clean")
+                clean.set_sensitive(False)
+                menu.append(clean)
+
+            menu.append(Gtk.SeparatorMenuItem())
+            self._action(menu, "Show dashboard…",
+                         lambda *_: self.show_dashboard())
+            self._action(menu, "Refresh now", lambda *_: self.refresh_menu())
+            self._action(menu, "Settings…", lambda *_: self._on_settings())
+
+            start_item = Gtk.CheckMenuItem(label="Start on login")
+            start_item.set_active(autostart_enabled())  # set before connecting
+            start_item.connect("toggled", self._on_toggle_autostart)
+            menu.append(start_item)
+
+            menu.append(Gtk.SeparatorMenuItem())
+            self._action(menu, "Quit", lambda *_: self.quit())
+            menu.show_all()
+            return menu
+
+        def _on_toggle_autostart(self, item):
+            ok = set_autostart(item.get_active())
+            # Reflect the real on-disk result (e.g. if the write failed).
+            if ok != item.get_active():
+                item.set_active(ok)
+
+        def _on_settings(self):
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = ConfigDialog(parent, self.config)
+            response = dlg.run()
+            if response == Gtk.ResponseType.OK:
+                self.config = dlg.get_config()
+                apply_config_to_env(self.config)
+                save_config(self.config)
+                # Re-arm the refresh timer with the (possibly new) interval.
+                if self._timer_id:
+                    GLib.source_remove(self._timer_id)
+                self._timer_id = GLib.timeout_add_seconds(
+                    resolve_interval(self.config), self._on_timer)
+                self.refresh_menu()
+                if self.window is not None:
+                    self.window.set_config(self.config)
+                    if self.window.get_visible():
+                        self.window.reload()
+            dlg.destroy()
+
+        def _repo_item(self, r):
+            track = ""
+            if r["ahead"] or r["behind"]:
+                track = f" ↑{r['ahead']}↓{r['behind']}"
+            item = Gtk.MenuItem(
+                label=f"{r['name']}  ({r['branch']}{track}, {r['count']})")
+            sub = Gtk.Menu()
+            path = r["path"]
+            self._action(sub, "Open terminal",
+                         lambda *_: notify(self.window, *open_terminal(path)))
+            self._action(sub, "Open Claude Code",
+                         lambda *_: notify(self.window, *open_claude(path)))
+            push_label = "git push" + (f" (↑{r['ahead']})" if r["ahead"] else "")
+            self._action(sub, push_label,
+                         lambda *_: notify(self.window, *open_push(path)))
+            if r.get("github"):
+                self._action(sub, "Open GitHub",
+                             lambda *_: notify(self.window, *open_github(path)))
+            self._action(sub, "Open folder",
+                         lambda *_: notify(self.window, *open_folder(path)))
+            self._action(sub, "Copy path", lambda *_: self._copy(path))
+            item.set_submenu(sub)
+            return item
+
+        @staticmethod
+        def _action(menu, label, handler):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", handler)
+            menu.append(item)
+            return item
+
+        def _copy(self, text):
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clip.set_text(text, -1)
+            clip.store()
+
+        # -- dashboard tier --
+        def show_dashboard(self):
+            if self.window is None:
+                self.window = DashboardWindow(self, self.config)
+            self.window.show_all()  # show the window chrome + containers
+            self.window.present()
+            self.window.reload()
+
+    class DashboardWindow(Gtk.Window):
+        def __init__(self, app, config):
+            super().__init__(title="repodash")
+            self.app = app
+            self.config = config
+            self.set_default_size(720, 560)
+            self.set_icon_name("utilities-terminal")
+            self.connect("delete-event", self._on_close)
+
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            outer.set_border_width(8)
+            self.add(outer)
+
+            bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.search = Gtk.SearchEntry()
+            self.search.set_placeholder_text("Filter by name or path…")
+            self.search.connect("search-changed", lambda *_: self._refilter())
+            bar.pack_start(self.search, True, True, 0)
+
+            self.dirty_only = Gtk.CheckButton(label="Dirty only")
+            self.dirty_only.connect("toggled", lambda *_: self._refilter())
+            bar.pack_start(self.dirty_only, False, False, 0)
+            self.has_todos = Gtk.CheckButton(label="Has TODOs")
+            self.has_todos.connect("toggled", lambda *_: self._refilter())
+            bar.pack_start(self.has_todos, False, False, 0)
+
+            refresh = Gtk.Button(label="Refresh")
+            refresh.connect("clicked", lambda *_: self.reload())
+            bar.pack_start(refresh, False, False, 0)
+
+            settings_btn = Gtk.Button(label="Settings…")
+            settings_btn.connect("clicked", lambda *_: self.app._on_settings())
+            bar.pack_start(settings_btn, False, False, 0)
+
+            outer.pack_start(bar, False, False, 0)
+
+            self.status = Gtk.Label(label="", xalign=0)
+            outer.pack_start(self.status, False, False, 0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            self.listbox = Gtk.ListBox()
+            self.listbox.set_filter_func(self._filter_row)
+            scroller.add(self.listbox)
+            outer.pack_start(scroller, True, True, 0)
+
+        def _on_close(self, *_):
+            self.hide()
+            return True  # keep the app alive; just hide
+
+        def set_config(self, config):
+            self.config = config
+
+        def reload(self):
+            self.status.set_text("Scanning…")
+            cfg = self.config
+
+            def work():
+                model = fetch_model()
+                excluded = set(cfg.get("excluded_repos", []))
+                model["repos"] = [
+                    r for r in model.get("repos", [])
+                    if r.get("path") not in excluded
+                ]
+                # Resolve GitHub URLs here (off the GTK thread) and stash them
+                # on each repo so row-building never blocks on git.
+                for repo in model["repos"]:
+                    repo["github"] = github_url(repo.get("path", ""))
+                GLib.idle_add(self._populate, model)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _populate(self, model):
+            for child in self.listbox.get_children():
+                self.listbox.remove(child)
+            if model.get("error"):
+                self.status.set_text("Error: " + model["error"])
+                return
+            repos = model.get("repos", [])
+            for repo in repos:
+                self.listbox.add(self._row(repo))
+            self.listbox.show_all()
+            self.status.set_text(f"{len(repos)} repos")
+            self._refilter()
+            return False
+
+        def _row(self, repo):
+            row = Gtk.ListBoxRow()
+            row._repo = repo  # stash for the filter
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            box.set_border_width(6)
+
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            git = repo.get("git", {})
+            todos = repo.get("todos", {})
+            track = ""
+            if git.get("ahead") or git.get("behind"):
+                track = f"  ↑{git.get('ahead', 0)}↓{git.get('behind', 0)}"
+            dirty_n = len(git.get("dirty_files", []))
+            title = Gtk.Label(xalign=0)
+            mark = "●" if git.get("dirty") else "○"
+            title.set_markup(
+                f"<b>{GLib.markup_escape_text(repo.get('name', '?'))}</b>  "
+                f"<small>{mark} {GLib.markup_escape_text(git.get('branch', ''))}"
+                f"{track}</small>")
+            info.pack_start(title, False, False, 0)
+
+            bits = []
+            if dirty_n:
+                bits.append(f"{dirty_n} changed")
+            if todos.get("total"):
+                bits.append(f"{todos['total']} TODO")
+            audit = repo.get("audit", {})
+            if audit.get("files") or audit.get("archive"):
+                bits.append("audit")
+            if any(f.get("items") for f in repo.get("roadmap", {}).get("files", [])):
+                bits.append("roadmap")
+            sonar = repo.get("sonar", {})
+            if sonar.get("configured"):
+                bits.append("sonar" if sonar.get("ok") else "sonar!")
+            sub = Gtk.Label(xalign=0)
+            sub.set_markup(f"<small>{GLib.markup_escape_text(' · '.join(bits) or 'clean')}</small>")
+            info.pack_start(sub, False, False, 0)
+            box.pack_start(info, True, True, 0)
+
+            path = repo.get("path", "")
+            box.pack_start(self._btn("utilities-terminal", "Terminal",
+                                     lambda *_: notify(self, *open_terminal(path))),
+                           False, False, 0)
+            box.pack_start(self._btn("system-run", "Claude Code",
+                                     lambda *_: notify(self, *open_claude(path))),
+                           False, False, 0)
+            push_tip = "git push" + (f" (↑{git.get('ahead')})" if git.get("ahead") else "")
+            box.pack_start(self._btn("go-up", push_tip,
+                                     lambda *_: notify(self, *open_push(path))),
+                           False, False, 0)
+            if repo.get("github"):
+                box.pack_start(self._btn("web-browser", "GitHub",
+                                         lambda *_: notify(self, *open_github(path))),
+                               False, False, 0)
+            box.pack_start(self._btn("folder", "Open folder",
+                                     lambda *_: notify(self, *open_folder(path))),
+                           False, False, 0)
+
+            row.add(box)
+            return row
+
+        @staticmethod
+        def _btn(icon_name, tooltip, handler):
+            btn = Gtk.Button()
+            btn.set_image(Gtk.Image.new_from_icon_name(
+                icon_name, Gtk.IconSize.BUTTON))
+            btn.set_tooltip_text(tooltip)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.connect("clicked", handler)
+            return btn
+
+        def _refilter(self):
+            self.listbox.invalidate_filter()
+
+        def _filter_row(self, row):
+            repo = getattr(row, "_repo", None)
+            if repo is None:
+                return True
+            text = self.search.get_text().strip().lower()
+            if text and text not in repo.get("name", "").lower() \
+                    and text not in repo.get("path", "").lower():
+                return False
+            if self.dirty_only.get_active() and not repo.get("git", {}).get("dirty"):
+                return False
+            if self.has_todos.get_active() and not repo.get("todos", {}).get("total"):
+                return False
+            return True
+
+    class ConfigDialog(Gtk.Dialog):
+        def __init__(self, parent, config):
+            super().__init__(title="Settings", transient_for=parent, modal=True)
+            self.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                             "Save", Gtk.ResponseType.OK)
+            self._config = dict(config)
+            self._config["excluded_repos"] = list(
+                config.get("excluded_repos", []))
+            self._repo_checks = {}  # path -> Gtk.CheckButton
+
+            notebook = Gtk.Notebook()
+            notebook.append_page(self._build_general_tab(),
+                                 Gtk.Label(label="General"))
+            notebook.append_page(self._build_repos_tab(),
+                                 Gtk.Label(label="Repositories"))
+            self.get_content_area().pack_start(notebook, True, True, 0)
+            self.set_default_size(520, 440)
+            self.show_all()
+
+        def _build_general_tab(self):
+            grid = Gtk.Grid()
+            grid.set_row_spacing(8)
+            grid.set_column_spacing(12)
+            grid.set_border_width(12)
+
+            def row(r, label_text, widget, hint=None):
+                lbl = Gtk.Label(label=label_text, xalign=1.0)
+                grid.attach(lbl, 0, r, 1, 1)
+                grid.attach(widget, 1, r, 1, 1)
+                widget.set_hexpand(True)
+                if hint:
+                    sub = Gtk.Label(label=hint, xalign=0.0)
+                    sub.get_style_context().add_class("dim-label")
+                    grid.attach(sub, 1, r + 1, 1, 1)
+
+            self._entry_base = Gtk.Entry()
+            self._entry_base.set_placeholder_text(
+                f"default: {base_dir()}")
+            self._entry_base.set_text(self._config.get("base_dir", ""))
+            row(0, "Base directory", self._entry_base)
+
+            adj_depth = Gtk.Adjustment(value=self._config.get("depth", 0),
+                                       lower=0, upper=10, step_increment=1)
+            self._spin_depth = Gtk.SpinButton(adjustment=adj_depth, digits=0)
+            row(2, "Scan depth", self._spin_depth,
+                "0 = use REPODASH_DEPTH env var or default (3)")
+
+            adj_iv = Gtk.Adjustment(
+                value=self._config.get("refresh_interval", 0),
+                lower=0, upper=3600, step_increment=5)
+            self._spin_interval = Gtk.SpinButton(adjustment=adj_iv, digits=0)
+            row(4, "Refresh interval (s)", self._spin_interval,
+                "0 = use REPODASH_TRAY_INTERVAL env var or default (90)")
+
+            self._entry_terminal = Gtk.Entry()
+            self._entry_terminal.set_placeholder_text(
+                "default: auto-detect (ptyxis, gnome-terminal, …)")
+            self._entry_terminal.set_text(self._config.get("terminal", ""))
+            row(6, "Terminal", self._entry_terminal)
+
+            return grid
+
+        def _build_repos_tab(self):
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            vbox.set_border_width(8)
+
+            hint = Gtk.Label(
+                label="Uncheck repos to exclude them from the dashboard and tray menu.",
+                xalign=0.0, wrap=True)
+            vbox.pack_start(hint, False, False, 0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            self._repo_listbox = Gtk.ListBox()
+            self._repo_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+            scroller.add(self._repo_listbox)
+            vbox.pack_start(scroller, True, True, 0)
+
+            rescan_btn = Gtk.Button(label="Rescan")
+            rescan_btn.connect("clicked", self._on_rescan)
+            vbox.pack_start(rescan_btn, False, False, 0)
+
+            self._populate_repo_list()
+            return vbox
+
+        def _populate_repo_list(self):
+            for child in self._repo_listbox.get_children():
+                self._repo_listbox.remove(child)
+            self._repo_checks.clear()
+
+            base = self._entry_base.get_text().strip() or base_dir()
+            depth_val = int(self._spin_depth.get_value())
+            depth = depth_val if depth_val > 0 else scan_depth()
+            excluded = set(self._config.get("excluded_repos", []))
+
+            def work():
+                repos = find_repos(base, depth)
+                GLib.idle_add(self._apply_repo_list, repos, excluded)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _apply_repo_list(self, repos, excluded):
+            for child in self._repo_listbox.get_children():
+                self._repo_listbox.remove(child)
+            self._repo_checks.clear()
+            for path in repos:
+                row = Gtk.ListBoxRow()
+                chk = Gtk.CheckButton(label=path)
+                chk.set_active(path not in excluded)
+                row.add(chk)
+                self._repo_listbox.add(row)
+                self._repo_checks[path] = chk
+            self._repo_listbox.show_all()
+            return False
+
+        def _on_rescan(self, *_):
+            self._populate_repo_list()
+
+        def get_config(self) -> dict:
+            cfg = dict(self._config)
+            cfg["base_dir"] = self._entry_base.get_text().strip()
+            cfg["depth"] = int(self._spin_depth.get_value())
+            cfg["refresh_interval"] = int(self._spin_interval.get_value())
+            cfg["terminal"] = self._entry_terminal.get_text().strip()
+            # Repos unchecked in the current scan list.
+            shown_excluded = {
+                path for path, chk in self._repo_checks.items()
+                if not chk.get_active()
+            }
+            # Preserve exclusions for repos not shown in the current scan
+            # (e.g. after a base_dir change the old paths aren't visible).
+            old_excluded = set(self._config.get("excluded_repos", []))
+            not_shown = old_excluded - set(self._repo_checks.keys())
+            cfg["excluded_repos"] = sorted(shown_excluded | not_shown)
+            return cfg
+
+    app = TrayApp()
+    return app.run([sys.argv[0]])
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    if "--check" in argv:
+        return run_check()
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

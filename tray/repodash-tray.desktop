@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=repodash tray
+Comment=Tray icon for the repodash multi-repo dashboard
+# Use an ABSOLUTE path — autostart runs with a minimal PATH.
+# Edit this to where you cloned repodash, e.g. %h/git/repodash/tray/repodash_tray.py
+Exec=/usr/bin/python3 %h/git/repodash/tray/repodash_tray.py
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;Utility;
+X-GNOME-Autostart-enabled=true
+# Let the AppIndicator GNOME extension finish loading before we register.
+X-GNOME-Autostart-Delay=3
