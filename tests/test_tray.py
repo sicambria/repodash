@@ -37,6 +37,24 @@ def _init_repo(path, origin=None):
                        check=True)
 
 
+def _commit(repo, fname="f.txt", text="x"):
+    with open(os.path.join(repo, fname), "w") as f:
+        f.write(text)
+    subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "c"], check=True)
+
+
+def _clone_of_bare(d):
+    """A working clone of a fresh local bare remote, with git identity set."""
+    remote = os.path.join(d, "remote.git")
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    work = os.path.join(d, "work")
+    subprocess.run(["git", "clone", "-q", remote, work], check=True)
+    subprocess.run(["git", "-C", work, "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", work, "config", "user.name", "t"], check=True)
+    return work
+
+
 class GithubUrlTest(unittest.TestCase):
     def test_ssh_scp_form(self):
         self.assertEqual(
@@ -198,6 +216,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg["refresh_interval"], 0)
         self.assertEqual(cfg["excluded_repos"], [])
         self.assertEqual(cfg["terminal"], "")
+        self.assertTrue(cfg["show_remoteless"])
 
     def test_roundtrip_save_load(self):
         cfg = tray.load_config()
@@ -205,12 +224,14 @@ class ConfigTest(unittest.TestCase):
         cfg["depth"] = 4
         cfg["refresh_interval"] = 120
         cfg["terminal"] = "xterm"
+        cfg["show_remoteless"] = False
         tray.save_config(cfg)
         loaded = tray.load_config()
         self.assertEqual(loaded["base_dir"], "/some/path")
         self.assertEqual(loaded["depth"], 4)
         self.assertEqual(loaded["refresh_interval"], 120)
         self.assertEqual(loaded["terminal"], "xterm")
+        self.assertFalse(loaded["show_remoteless"])
 
     def test_excluded_repos_survives_roundtrip(self):
         cfg = tray.load_config()
@@ -338,6 +359,60 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_find_repos_missing_base_is_empty(self):
         self.assertEqual(tray.find_repos("/no/such/path/xyz", depth=2), [])
+
+
+class UnpushedTest(unittest.TestCase):
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_committed_but_never_pushed_is_unpushed(self):
+        # A remote is configured but the branch was never pushed, so it has no
+        # upstream: `ahead` stays 0 while `unpushed` catches the local commit.
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            st = tray.git_status(work)
+            self.assertTrue(st["has_remote"])
+            self.assertEqual(st["ahead"], 0)
+            self.assertGreaterEqual(st["unpushed"], 1)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_fully_pushed_is_not_unpushed(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            subprocess.run(["git", "-C", work, "push", "-q", "origin", "HEAD"],
+                           check=True)
+            st = tray.git_status(work)
+            self.assertTrue(st["has_remote"])
+            self.assertEqual(st["unpushed"], 0)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_other_branches_do_not_inflate_count(self):
+        # Unpushed is scoped to the current branch (HEAD), not all local
+        # branches: a fully-pushed main must report 0 even when an unpushed
+        # feature branch carries its own commit.
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            subprocess.run(["git", "-C", work, "push", "-q", "origin", "HEAD"],
+                           check=True)
+            subprocess.run(["git", "-C", work, "checkout", "-q", "-b", "feature"],
+                           check=True)
+            _commit(work, fname="g.txt")
+            subprocess.run(["git", "-C", work, "checkout", "-q", "-"], check=True)
+            st = tray.git_status(work)
+            self.assertEqual(st["unpushed"], 0)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_no_remote_is_never_unpushed(self):
+        # Guard against the `--not --remotes` trap: with no remote to exclude,
+        # rev-list would otherwise count every commit in the repo.
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "local")
+            _init_repo(repo)
+            _commit(repo)
+            st = tray.git_status(repo)
+            self.assertFalse(st["has_remote"])
+            self.assertEqual(st["unpushed"], 0)
 
 
 if __name__ == "__main__":

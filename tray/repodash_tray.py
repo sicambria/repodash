@@ -44,6 +44,7 @@ CONFIG_DEFAULTS = {
     "refresh_interval": 0,
     "excluded_repos": [],
     "terminal": "",
+    "show_remoteless": True,
 }
 
 
@@ -199,6 +200,22 @@ def git_status(repo: str) -> dict:
     ahead = int(_AHEAD_RE.search(header).group(1)) if _AHEAD_RE.search(header) else 0
     behind = int(_BEHIND_RE.search(header).group(1)) if _BEHIND_RE.search(header) else 0
 
+    # "Unpushed" = commits on the *current branch* not on any remote. We scope to
+    # HEAD (not --branches) so the count matches the branch shown in the menu: a
+    # repo with many stale local feature branches would otherwise report their
+    # combined commits, inflating the number far past what HEAD is ahead by.
+    # rev-list against --remotes (rather than `ahead`) still catches branches that
+    # were never pushed — no upstream → ahead 0, but their HEAD commits aren't on
+    # any remote. Only meaningful when a remote exists: without one, --not
+    # --remotes excludes nothing and the command would count every commit.
+    has_remote = bool(_git(repo, "remote").strip())
+    unpushed = 0
+    if has_remote:
+        out = _git(repo, "rev-list", "--count", "HEAD",
+                   "--not", "--remotes").strip()
+        if out.isdigit():
+            unpushed = int(out)
+
     return {
         "path": os.path.abspath(repo),
         "name": os.path.basename(repo.rstrip(os.sep)),
@@ -207,6 +224,8 @@ def git_status(repo: str) -> dict:
         "behind": behind,
         "dirty": bool(files),
         "count": len(files),
+        "has_remote": has_remote,
+        "unpushed": unpushed,
     }
 
 
@@ -440,7 +459,9 @@ def run_check() -> int:
     depth = resolve_depth(cfg)
     interval = resolve_interval(cfg)
     excluded = set(cfg.get("excluded_repos", []))
+    show_remoteless = cfg.get("show_remoteless", True)
     print(f"scan root : {base}  (depth {depth}, interval {interval}s)")
+    print(f"remoteless: {'shown' if show_remoteless else 'hidden'} in menu")
     if excluded:
         print(f"excluded  : {len(excluded)} repo(s)")
         for p in sorted(excluded):
@@ -456,8 +477,12 @@ def run_check() -> int:
 
     repos = scan_dirty(base, depth)
     repos = [r for r in repos if r["path"] not in excluded]
+    if not show_remoteless:
+        repos = [r for r in repos if r["has_remote"]]
     dirty = [r for r in repos if r["dirty"]]
-    print(f"\nrepos     : {len(repos)} found, {len(dirty)} dirty")
+    unpushed = [r for r in repos if r["has_remote"] and r["unpushed"] > 0]
+    print(f"\nrepos     : {len(repos)} found, {len(dirty)} dirty, "
+          f"{len(unpushed)} unpushed")
     for r in dirty:
         track = ""
         if r["ahead"] or r["behind"]:
@@ -465,6 +490,12 @@ def run_check() -> int:
         gh = github_url(r["path"])
         print(f"  • {r['name']}  [{r['branch']}{track}]  "
               f"{r['count']} file(s)" + (f"  {gh}" if gh else ""))
+    if unpushed:
+        print("\nunpushed  :")
+        for r in unpushed:
+            gh = github_url(r["path"])
+            print(f"  • {r['name']}  [{r['branch']} +{r['unpushed']}]"
+                  + (f"  {gh}" if gh else ""))
     return 0
 
 
@@ -576,10 +607,13 @@ def run_gui() -> int:
                 excluded = set(cfg.get("excluded_repos", []))
                 repos = scan_dirty(base, depth)
                 repos = [r for r in repos if r["path"] not in excluded]
+                if not cfg.get("show_remoteless", True):
+                    repos = [r for r in repos if r["has_remote"]]
                 # Resolve GitHub URLs off the main thread so menu-building
-                # (which runs on the GTK thread) never blocks on git.
+                # (which runs on the GTK thread) never blocks on git. Both the
+                # dirty and unpushed sections expose an "Open GitHub" action.
                 for r in repos:
-                    if r["dirty"]:
+                    if r["dirty"] or (r["has_remote"] and r["unpushed"]):
                         r["github"] = github_url(r["path"])
                 GLib.idle_add(self._apply_repos, repos)
             threading.Thread(target=work, daemon=True).start()
@@ -594,8 +628,11 @@ def run_gui() -> int:
         def _build_menu(self):
             menu = Gtk.Menu()
             dirty = [r for r in self.repos if r["dirty"]]
+            unpushed = [r for r in self.repos
+                        if r["has_remote"] and r["unpushed"] > 0]
             header = Gtk.MenuItem(
-                label=f"{len(dirty)} dirty · {len(self.repos)} repos")
+                label=f"{len(dirty)} dirty · {len(unpushed)} unpushed · "
+                      f"{len(self.repos)} repos")
             header.set_sensitive(False)
             menu.append(header)
             menu.append(Gtk.SeparatorMenuItem())
@@ -606,6 +643,16 @@ def run_gui() -> int:
                 clean = Gtk.MenuItem(label="✓ all clean")
                 clean.set_sensitive(False)
                 menu.append(clean)
+
+            # Unpushed repos get their own section (a repo can be both dirty and
+            # unpushed — it then appears in both lists, each complete on its own).
+            if unpushed:
+                menu.append(Gtk.SeparatorMenuItem())
+                sub_header = Gtk.MenuItem(label="Unpushed")
+                sub_header.set_sensitive(False)
+                menu.append(sub_header)
+                for r in unpushed:
+                    menu.append(self._repo_item(r, unpushed=True))
 
             menu.append(Gtk.SeparatorMenuItem())
             self._action(menu, "Show dashboard…",
@@ -649,12 +696,17 @@ def run_gui() -> int:
                         self.window.reload()
             dlg.destroy()
 
-        def _repo_item(self, r):
-            track = ""
-            if r["ahead"] or r["behind"]:
-                track = f" ↑{r['ahead']}↓{r['behind']}"
-            item = Gtk.MenuItem(
-                label=f"{r['name']}  ({r['branch']}{track}, {r['count']})")
+        def _repo_item(self, r, unpushed=False):
+            if unpushed:
+                # In the unpushed section, lead with the unpushed-commit count
+                # (a clean-but-unpushed repo has no dirty files to show).
+                label = f"{r['name']}  ({r['branch']}, +{r['unpushed']})"
+            else:
+                track = ""
+                if r["ahead"] or r["behind"]:
+                    track = f" ↑{r['ahead']}↓{r['behind']}"
+                label = f"{r['name']}  ({r['branch']}{track}, {r['count']})"
+            item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
             path = r["path"]
             self._action(sub, "Open terminal",
@@ -926,6 +978,12 @@ def run_gui() -> int:
             self._entry_terminal.set_text(self._config.get("terminal", ""))
             row(6, "Terminal", self._entry_terminal)
 
+            self._chk_remoteless = Gtk.CheckButton(
+                label="Show repos without a remote")
+            self._chk_remoteless.set_active(
+                self._config.get("show_remoteless", True))
+            grid.attach(self._chk_remoteless, 1, 8, 1, 1)
+
             return grid
 
         def _build_repos_tab(self):
@@ -990,6 +1048,7 @@ def run_gui() -> int:
             cfg["depth"] = int(self._spin_depth.get_value())
             cfg["refresh_interval"] = int(self._spin_interval.get_value())
             cfg["terminal"] = self._entry_terminal.get_text().strip()
+            cfg["show_remoteless"] = self._chk_remoteless.get_active()
             # Repos unchecked in the current scan list.
             shown_excluded = {
                 path for path, chk in self._repo_checks.items()
