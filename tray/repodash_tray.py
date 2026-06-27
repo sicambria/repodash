@@ -750,6 +750,7 @@ def run_gui() -> int:
             super().__init__(title="repodash")
             self.app = app
             self.config = config
+            self._loading = False  # guards against overlapping reloads
             self.set_default_size(720, 560)
             self.set_icon_name("utilities-terminal")
             self.connect("delete-event", self._on_close)
@@ -771,9 +772,9 @@ def run_gui() -> int:
             self.has_todos.connect("toggled", lambda *_: self._refilter())
             bar.pack_start(self.has_todos, False, False, 0)
 
-            refresh = Gtk.Button(label="Refresh")
-            refresh.connect("clicked", lambda *_: self.reload())
-            bar.pack_start(refresh, False, False, 0)
+            self.refresh_btn = Gtk.Button(label="Refresh")
+            self.refresh_btn.connect("clicked", lambda *_: self.reload())
+            bar.pack_start(self.refresh_btn, False, False, 0)
 
             settings_btn = Gtk.Button(label="Settings…")
             settings_btn.connect("clicked", lambda *_: self.app._on_settings())
@@ -799,6 +800,14 @@ def run_gui() -> int:
             self.config = config
 
         def reload(self):
+            # Ignore re-entry: a running scan holds a repodash.py --json
+            # subprocess, and overlapping reloads would race to repopulate
+            # the listbox. The button is also disabled for the duration.
+            if self._loading:
+                return
+            self._loading = True
+            self.refresh_btn.set_sensitive(False)
+            self.refresh_btn.set_label("Refresh (…)")
             self.status.set_text("Scanning…")
             cfg = self.config
 
@@ -819,13 +828,18 @@ def run_gui() -> int:
         def _populate(self, model):
             for child in self.listbox.get_children():
                 self.listbox.remove(child)
+            self._loading = False
+            self.refresh_btn.set_sensitive(True)
             if model.get("error"):
+                self.refresh_btn.set_label("Refresh")
                 self.status.set_text("Error: " + model["error"])
-                return
+                return False
             repos = model.get("repos", [])
             for repo in repos:
                 self.listbox.add(self._row(repo))
             self.listbox.show_all()
+            # Show the result count in brackets on the button as a completion cue.
+            self.refresh_btn.set_label(f"Refresh ({len(repos)})")
             self.status.set_text(f"{len(repos)} repos")
             self._refilter()
             return False
