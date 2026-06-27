@@ -415,5 +415,53 @@ class UnpushedTest(unittest.TestCase):
             self.assertEqual(st["unpushed"], 0)
 
 
+class PushRepoTest(unittest.TestCase):
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_first_push_sets_upstream(self):
+        # No upstream on the branch (clone of an empty remote) → push_repo must
+        # use `-u <remote> HEAD` so the first push actually goes through.
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            self.assertGreaterEqual(tray.git_status(work)["unpushed"], 1)
+            ok, out = tray.push_repo(work)
+            self.assertTrue(ok, out)
+            self.assertEqual(tray.git_status(work)["unpushed"], 0)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_subsequent_push_with_upstream(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            ok, _ = tray.push_repo(work)          # first push sets the upstream
+            self.assertTrue(ok)
+            _commit(work, fname="g.txt")
+            self.assertEqual(tray.git_status(work)["unpushed"], 1)
+            ok, out = tray.push_repo(work)         # now a plain `git push`
+            self.assertTrue(ok, out)
+            self.assertEqual(tray.git_status(work)["unpushed"], 0)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_failure_reports_output_without_hanging(self):
+        # A file:// remote that does not exist fails fast (no auth prompt).
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo, origin="file:///nonexistent/repo.git")
+            _commit(repo)
+            ok, out = tray.push_repo(repo)
+            self.assertFalse(ok)
+            self.assertTrue(out)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_no_remote_reports_clearly(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            ok, out = tray.push_repo(repo)
+            self.assertFalse(ok)
+            self.assertIn("no remote", out)
+
+
 if __name__ == "__main__":
     unittest.main()

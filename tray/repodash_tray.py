@@ -369,6 +369,56 @@ def open_push(path: str):
     return open_terminal(path, "git push")
 
 
+# Environment that disables every interactive auth prompt, so a push that would
+# otherwise block on credentials fails fast instead of hanging the progress
+# dialog. BatchMode still lets a loaded ssh-agent / credential helper succeed.
+_NONINTERACTIVE_GIT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
+    "SSH_ASKPASS_REQUIRE": "never",
+}
+
+
+def _current_upstream(path: str, env) -> str:
+    """The current branch's upstream ref (e.g. ``origin/main``), or ``""``."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--abbrev-ref",
+             "--symbolic-full-name", "@{u}"],
+            capture_output=True, text=True, timeout=15, env=env)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def push_repo(path: str):
+    """Push *path* non-interactively. Returns ``(ok, output)`` and never raises.
+
+    This is the batch counterpart to ``open_push`` (which opens a terminal for
+    repos that need an interactive passphrase). When the current branch has an
+    upstream it runs a plain ``git push``; otherwise — the never-pushed case the
+    unpushed section exists to surface — it runs ``git push -u <remote> HEAD`` so
+    the first push actually goes through (and records the upstream).
+    """
+    env = {**os.environ, **_NONINTERACTIVE_GIT_ENV}
+    if _current_upstream(path, env):
+        argv = ["git", "-C", path, "push"]
+    else:
+        remote = next(iter(_git(path, "remote").split()), "")
+        if not remote:
+            return False, "no remote configured"
+        argv = ["git", "-C", path, "push", "-u", remote, "HEAD"]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=120, env=env)
+    except subprocess.TimeoutExpired:
+        return False, ("timed out — push needs interactive auth; "
+                       "use the repo's 'git push' action in a terminal")
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    return out.returncode == 0, (out.stdout + out.stderr).strip()
+
+
 # ── autostart (configurable from the menu) ───────────────────────────────────
 _AUTOSTART_NAME = "repodash-tray.desktop"
 
@@ -653,6 +703,8 @@ def run_gui() -> int:
                 menu.append(sub_header)
                 for r in unpushed:
                     menu.append(self._repo_item(r, unpushed=True))
+                self._action(menu, f"Push all ({len(unpushed)})…",
+                             lambda *_: self._on_push_all())
 
             menu.append(Gtk.SeparatorMenuItem())
             self._action(menu, "Show dashboard…",
@@ -695,6 +747,19 @@ def run_gui() -> int:
                     if self.window.get_visible():
                         self.window.reload()
             dlg.destroy()
+
+        def _on_push_all(self):
+            # Recompute from the latest scan (the menu may have refreshed since
+            # it was built) so we never push a stale set.
+            repos = [r for r in self.repos
+                     if r["has_remote"] and r["unpushed"] > 0]
+            if not repos:
+                return
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = PushAllDialog(parent, repos)
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()  # reflect the now-pushed repos
 
         def _repo_item(self, r, unpushed=False):
             if unpushed:
@@ -931,6 +996,115 @@ def run_gui() -> int:
             if self.has_todos.get_active() and not repo.get("todos", {}).get("total"):
                 return False
             return True
+
+    class PushAllDialog(Gtk.Dialog):
+        """Modal progress window for pushing every unpushed repo in sequence.
+
+        High-level: a progress bar plus one ✓/✗ row per repo. Detail (the raw
+        git output) lives in a collapsed-by-default expander. Pushing starts on
+        open; the Close button stays disabled until every repo is done so the
+        dialog can't be dismissed mid-run.
+        """
+
+        PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
+
+        def __init__(self, parent, repos):
+            super().__init__(title="Push all", transient_for=parent, modal=True)
+            self._repos = repos
+            self._marks = {}  # path -> status Gtk.Label
+            self._done = False
+            self.add_button("Close", Gtk.ResponseType.CLOSE)
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
+            # Block the window-manager close button until the run finishes, so
+            # the worker never updates widgets on a destroyed dialog.
+            self.connect("delete-event", lambda *_: not self._done)
+            self.set_default_size(460, 360)
+
+            area = self.get_content_area()
+            area.set_border_width(10)
+            area.set_spacing(8)
+
+            self._summary = Gtk.Label(
+                label=f"Pushing {len(repos)} repo(s)…", xalign=0)
+            area.pack_start(self._summary, False, False, 0)
+
+            self._bar = Gtk.ProgressBar()
+            self._bar.set_show_text(True)
+            self._bar.set_text(f"0 / {len(repos)}")
+            area.pack_start(self._bar, False, False, 0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            listbox = Gtk.ListBox()
+            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+            for r in repos:
+                row = Gtk.ListBoxRow()
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                box.set_border_width(4)
+                mark = Gtk.Label(label=self.PENDING)
+                name = Gtk.Label(
+                    label=f"{r['name']}  ({r['branch']}, +{r['unpushed']})",
+                    xalign=0)
+                box.pack_start(mark, False, False, 0)
+                box.pack_start(name, True, True, 0)
+                row.add(box)
+                listbox.add(row)
+                self._marks[r["path"]] = mark
+            scroller.add(listbox)
+            area.pack_start(scroller, True, True, 0)
+
+            self._log = Gtk.TextView()
+            self._log.set_editable(False)
+            self._log.set_cursor_visible(False)
+            self._log.set_monospace(True)
+            self._log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            log_scroll = Gtk.ScrolledWindow()
+            log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                  Gtk.PolicyType.AUTOMATIC)
+            log_scroll.set_min_content_height(150)
+            log_scroll.add(self._log)
+            expander = Gtk.Expander(label="Details")
+            expander.add(log_scroll)
+            area.pack_start(expander, False, False, 0)
+
+            self.show_all()
+            self._start()
+
+        def _start(self):
+            def work():
+                ok = 0
+                total = len(self._repos)
+                for i, r in enumerate(self._repos, 1):
+                    GLib.idle_add(self._mark, r["path"], self.RUNNING)
+                    success, output = push_repo(r["path"])
+                    ok += 1 if success else 0
+                    GLib.idle_add(self._step, i, total, r, success, output)
+                GLib.idle_add(self._finish, ok, total)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _mark(self, path, glyph):
+            self._marks[path].set_text(glyph)
+            return False
+
+        def _step(self, i, total, r, success, output):
+            self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
+            self._bar.set_fraction(i / total)
+            self._bar.set_text(f"{i} / {total}")
+            buf = self._log.get_buffer()
+            buf.insert(buf.get_end_iter(),
+                       f"=== {r['name']} ===\n{output or '(no output)'}\n\n")
+            return False
+
+        def _finish(self, ok, total):
+            failed = total - ok
+            msg = f"Pushed {ok}/{total}"
+            if failed:
+                msg += f" · {failed} failed (see Details)"
+            self._summary.set_text(msg)
+            self._bar.set_fraction(1.0)
+            self._done = True
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
+            return False
 
     class ConfigDialog(Gtk.Dialog):
         def __init__(self, parent, config):
