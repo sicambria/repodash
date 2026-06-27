@@ -1278,7 +1278,10 @@ def run_gui() -> int:
         PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
 
         def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd):
-            super().__init__(title="Commit all", transient_for=parent, modal=True)
+            # Title reflects scope: the single-repo path (per-repo submenu) would
+            # be misleading under "Commit all", so name the one repo instead.
+            title = f"Commit {repos[0]['name']}" if len(repos) == 1 else "Commit all"
+            super().__init__(title=title, transient_for=parent, modal=True)
             self._repos = repos
             self._timeout = timeout
             self._budget = budget_usd
@@ -1294,9 +1297,10 @@ def run_gui() -> int:
             area.set_border_width(10)
             area.set_spacing(8)
 
-            self._summary = Gtk.Label(
-                label=f"Committing {len(repos)} repo(s), "
-                      f"{self._workers} at a time…", xalign=0)
+            summary = (f"Committing {repos[0]['name']}…" if len(repos) == 1
+                       else f"Committing {len(repos)} repo(s), "
+                            f"{self._workers} at a time…")
+            self._summary = Gtk.Label(label=summary, xalign=0)
             area.pack_start(self._summary, False, False, 0)
 
             self._bar = Gtk.ProgressBar()
