@@ -1158,7 +1158,7 @@ def run_gui() -> int:
         """Modal progress window for pushing every unpushed repo in sequence.
 
         High-level: a progress bar plus one ✓/✗ row per repo. Detail (the raw
-        git output) lives in a collapsed-by-default expander. Pushing starts on
+        git output) lives in an expander shown open by default. Pushing starts on
         open; the Close button stays disabled until every repo is done so the
         dialog can't be dismissed mid-run.
         """
@@ -1222,6 +1222,7 @@ def run_gui() -> int:
             log_scroll.add(self._log)
             expander = Gtk.Expander(label="Details")
             expander.add(log_scroll)
+            expander.set_expanded(True)  # show output by default
             area.pack_start(expander, False, False, 0)
 
             self.show_all()
@@ -1338,6 +1339,7 @@ def run_gui() -> int:
             log_scroll.add(self._log)
             expander = Gtk.Expander(label="Details")
             expander.add(log_scroll)
+            expander.set_expanded(True)  # show output by default
             area.pack_start(expander, False, False, 0)
 
             self.show_all()
