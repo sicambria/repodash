@@ -897,6 +897,21 @@ def run_gui() -> int:
             dlg.destroy()
             self.refresh_menu()  # reflect now-clean / merged repos
 
+        def _on_commit_repo(self, r):
+            # Single-repo counterpart to _on_commit_all: same headless-Claude
+            # flow (logical chunks, repo-conventional messages, docs, merge),
+            # just scoped to one repo via the shared progress dialog.
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = CommitAllDialog(parent, [r],
+                                  cfg.get("commit_ram_mb", 2048),
+                                  cfg.get("commit_max_workers", 0),
+                                  cfg.get("commit_timeout", 900),
+                                  cfg.get("commit_budget_usd", 10.0))
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()  # reflect now-clean / merged repo
+
         def _repo_item(self, r, unpushed=False):
             if unpushed:
                 # In the unpushed section, lead with the unpushed-commit count
@@ -917,6 +932,9 @@ def run_gui() -> int:
             commit_label = "git commit" + (f" ({r['count']})" if r["count"] else "")
             self._action(sub, commit_label,
                          lambda *_: notify(self.window, *open_commit(path)))
+            if r["count"]:
+                self._action(sub, "Commit via Claude Code…",
+                             lambda *_, r=r: self._on_commit_repo(r))
             push_label = "git push" + (f" (+{r['ahead']})" if r["ahead"] else "")
             self._action(sub, push_label,
                          lambda *_: notify(self.window, *open_push(path)))
