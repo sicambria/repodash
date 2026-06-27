@@ -157,6 +157,8 @@ class PushActionTest(unittest.TestCase):
         try:
             argv = tray.terminal_argv("ptyxis", "/x", "git push")
             self.assertIn("git push; exec bash", argv)
+            argv = tray.terminal_argv("ptyxis", "/x", "git add -A && git commit")
+            self.assertIn("git add -A && git commit; exec bash", argv)
         finally:
             if saved is None:
                 os.environ.pop("REPODASH_TERMINAL", None)
@@ -461,6 +463,82 @@ class PushRepoTest(unittest.TestCase):
             ok, out = tray.push_repo(repo)
             self.assertFalse(ok)
             self.assertIn("no remote", out)
+
+
+class CommitWorkersTest(unittest.TestCase):
+    """commit_workers() concurrency math (RAM ÷ budget, clamped)."""
+
+    def setUp(self):
+        self._orig = tray._mem_available_mb
+
+    def tearDown(self):
+        tray._mem_available_mb = self._orig
+
+    def _fake_mem(self, mb):
+        tray._mem_available_mb = lambda: mb
+
+    def test_ram_divides_budget(self):
+        self._fake_mem(16384)            # 16 GB available
+        # 16384 // 2048 = 8, but clamped by CPU count.
+        expected = min(8, os.cpu_count() or 1)
+        self.assertEqual(tray.commit_workers(2048, 0), expected)
+
+    def test_tiny_ram_clamps_to_one(self):
+        self._fake_mem(512)              # less than one 2 GB slot
+        self.assertEqual(tray.commit_workers(2048, 0), 1)
+
+    def test_unknown_ram_is_one(self):
+        self._fake_mem(0)                # /proc/meminfo unreadable
+        self.assertEqual(tray.commit_workers(2048, 0), 1)
+
+    def test_cap_limits_workers(self):
+        self._fake_mem(65536)            # plenty of RAM
+        self.assertEqual(tray.commit_workers(1024, 2), 2)
+
+    def test_cap_zero_is_auto(self):
+        self._fake_mem(65536)
+        # No cap → bounded only by CPU count (RAM allows many).
+        self.assertEqual(tray.commit_workers(256, 0), os.cpu_count() or 1)
+
+    def test_always_at_least_one(self):
+        self._fake_mem(0)
+        self.assertGreaterEqual(tray.commit_workers(99999, 99), 1)
+
+
+class MemAvailableTest(unittest.TestCase):
+    @unittest.skipUnless(os.path.exists("/proc/meminfo"), "no /proc/meminfo")
+    def test_returns_positive_on_linux(self):
+        self.assertGreater(tray._mem_available_mb(), 0)
+
+
+class CommitArgvTest(unittest.TestCase):
+    def test_contains_headless_flags(self):
+        argv = tray.commit_argv("/x/claude", 10.0)
+        self.assertEqual(argv[0], "/x/claude")
+        self.assertIn("-p", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("json", argv)
+        self.assertIn("--max-budget-usd", argv)
+        self.assertIn("10.0", argv)
+        # The prompt is passed as the argument to -p.
+        self.assertEqual(argv[argv.index("-p") + 1], tray.COMMIT_PROMPT)
+
+    def test_zero_budget_omits_flag(self):
+        argv = tray.commit_argv("/x/claude", 0)
+        self.assertNotIn("--max-budget-usd", argv)
+
+
+class CommitRepoTest(unittest.TestCase):
+    def test_missing_claude_reports_clearly(self):
+        orig = tray.shutil.which
+        tray.shutil.which = lambda _: None
+        try:
+            ok, out = tray.commit_repo("/tmp", timeout=5)
+        finally:
+            tray.shutil.which = orig
+        self.assertFalse(ok)
+        self.assertIn("claude not found", out)
 
 
 if __name__ == "__main__":

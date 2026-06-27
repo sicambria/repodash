@@ -32,6 +32,28 @@ import sys
 DEFAULT_DEPTH = 3
 DEFAULT_INTERVAL = 90  # seconds between cheap menu refreshes
 CLAUDE_COMMAND = "claude --dangerously-skip-permissions"
+# Headless "Commit all": the claude binary (resolved via shutil.which) and the
+# instruction it runs non-interactively per repo. The run is bounded by a dollar
+# budget (--max-budget-usd) rather than turns — this claude build has no
+# --max-turns flag, and a budget caps a runaway RCA/fix loop just as well.
+CLAUDE_BIN = "claude"
+COMMIT_PROMPT = (
+    "You are operating non-interactively in a git repository. Follow THIS "
+    "repository's own workflow rules (e.g. CLAUDE.md / CONTRIBUTING) strictly.\n"
+    "1. Review the working-tree changes (git status, git diff). Group them into "
+    "logical commits — one coherent change per commit — and commit them on the "
+    "CURRENT branch with messages matching the repo's conventions.\n"
+    "2. If a commit fails (failing pre-commit hook, linter, formatter, tests, "
+    "etc.), do root-cause analysis, fix the underlying issue by editing files as "
+    "needed, and retry. Repeat until it succeeds.\n"
+    "3. After everything is committed: if the current branch is NOT the repo's "
+    "main branch (main or master), merge the current branch into the main "
+    "branch, resolving any conflicts. This merge is a batch policy; if this "
+    "repo's own rules explicitly forbid committing/merging to main locally, "
+    "SKIP the merge and say so in your result.\n"
+    "4. Do NOT push and do not contact any remote.\n"
+    "Work autonomously; never ask questions."
+)
 # Preference order; first one found on PATH wins unless REPODASH_TERMINAL is set.
 TERMINAL_PREFERENCE = ("ptyxis", "gnome-terminal", "kgx", "ghostty", "xterm")
 
@@ -45,6 +67,10 @@ CONFIG_DEFAULTS = {
     "excluded_repos": [],
     "terminal": "",
     "show_remoteless": True,
+    "commit_ram_mb": 2048,      # RAM budget per claude process (MB)
+    "commit_max_workers": 0,    # 0 = auto (RAM/CPU derived); >0 = hard cap
+    "commit_timeout": 900,      # seconds per repo (agentic runs are slow)
+    "commit_budget_usd": 10.0,  # max $ a single repo's claude run may spend
 }
 
 
@@ -369,6 +395,14 @@ def open_push(path: str):
     return open_terminal(path, "git push")
 
 
+def open_commit(path: str):
+    # Stage every change first, then open `git commit` so the editor comes up
+    # with the working-tree changes ready (the menu's count includes untracked
+    # files, which a bare `git commit` would leave unstaged → "nothing to
+    # commit"). The keep-open shell leaves the user in the repo afterwards.
+    return open_terminal(path, "git add -A && git commit")
+
+
 # Environment that disables every interactive auth prompt, so a push that would
 # otherwise block on credentials fails fast instead of hanging the progress
 # dialog. BatchMode still lets a loaded ssh-agent / credential helper succeed.
@@ -417,6 +451,76 @@ def push_repo(path: str):
     except (OSError, subprocess.SubprocessError) as e:
         return False, str(e)
     return out.returncode == 0, (out.stdout + out.stderr).strip()
+
+
+# ── batch commit (headless Claude Code) ──────────────────────────────────────
+def _mem_available_mb() -> int:
+    """Available RAM in MB from /proc/meminfo, or 0 if unknown (non-Linux)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024  # kB → MB
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def commit_workers(ram_mb: int, cap: int) -> int:
+    """How many claude processes to run at once.
+
+    MemAvailable // ram_mb, then clamped by CPU count and (if set) the config
+    cap. Always at least 1, so the batch still runs on a tiny / unknown host.
+    """
+    ram_mb = max(256, int(ram_mb or 2048))
+    avail = _mem_available_mb()
+    n = max(1, avail // ram_mb) if avail > 0 else 1
+    n = min(n, os.cpu_count() or 1)
+    if cap and int(cap) > 0:
+        n = min(n, int(cap))
+    return max(1, n)
+
+
+def commit_argv(bin_path: str, budget_usd: float) -> list:
+    """argv to run claude headlessly with COMMIT_PROMPT, bounded by a $ budget."""
+    argv = [bin_path, "-p", COMMIT_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "json"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    return argv
+
+
+def commit_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
+    """Run claude in *path* to commit (and maybe merge). Returns ``(ok, output)``.
+
+    Never raises. ``ok`` is True only on a clean exit; a non-zero exit (error or
+    budget exhaustion) may still have landed partial commits — callers re-scan
+    afterwards rather than trusting this flag as the final repo state. Unlike
+    ``push_repo`` the child keeps the user's full environment (claude needs its
+    auth, PATH and node), and stdin is closed so it never blocks on input.
+    """
+    bin_path = shutil.which(CLAUDE_BIN)
+    if not bin_path:
+        return False, "claude not found on PATH"
+    try:
+        out = subprocess.run(commit_argv(bin_path, budget_usd), cwd=path,
+                             stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    # Prefer claude's JSON "result" summary; fall back to raw output.
+    msg = (out.stdout or out.stderr).strip()
+    try:
+        import json
+        doc = json.loads(out.stdout)
+        if isinstance(doc, dict) and doc.get("result"):
+            msg = str(doc["result"]).strip()
+    except ValueError:
+        pass
+    return out.returncode == 0, msg
 
 
 # ── autostart (configurable from the menu) ───────────────────────────────────
@@ -524,6 +628,18 @@ def run_check() -> int:
         print("  claude argv    :", terminal_argv(term, base, CLAUDE_COMMAND))
     print(f"autostart : {'on' if autostart_enabled() else 'off'}  "
           f"({autostart_file()})")
+
+    ram_mb = cfg.get("commit_ram_mb", 2048)
+    cap = cfg.get("commit_max_workers", 0)
+    workers = commit_workers(ram_mb, cap)
+    cap_desc = f"cap {cap}" if cap else "auto"
+    avail = _mem_available_mb()
+    avail_desc = f"{avail} MB avail" if avail else "RAM unknown"
+    claude_bin = shutil.which(CLAUDE_BIN) or "(not on PATH)"
+    print(f"commit    : {ram_mb} MB/proc, {cap_desc} → {workers} workers, "
+          f"{cfg.get('commit_timeout', 900)}s timeout, "
+          f"${cfg.get('commit_budget_usd', 10.0)}/repo  [{avail_desc}]")
+    print(f"  claude   : {claude_bin}")
 
     repos = scan_dirty(base, depth)
     repos = [r for r in repos if r["path"] not in excluded]
@@ -693,6 +809,9 @@ def run_gui() -> int:
                 clean = Gtk.MenuItem(label="✓ all clean")
                 clean.set_sensitive(False)
                 menu.append(clean)
+            else:
+                self._action(menu, f"Commit all ({len(dirty)})…",
+                             lambda *_: self._on_commit_all())
 
             # Unpushed repos get their own section (a repo can be both dirty and
             # unpushed — it then appears in both lists, each complete on its own).
@@ -761,6 +880,23 @@ def run_gui() -> int:
             dlg.destroy()
             self.refresh_menu()  # reflect the now-pushed repos
 
+        def _on_commit_all(self):
+            # Recompute the dirty set from the latest scan so a refresh between
+            # menu-build and click never commits a stale list.
+            repos = [r for r in self.repos if r["dirty"]]
+            if not repos:
+                return
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = CommitAllDialog(parent, repos,
+                                  cfg.get("commit_ram_mb", 2048),
+                                  cfg.get("commit_max_workers", 0),
+                                  cfg.get("commit_timeout", 900),
+                                  cfg.get("commit_budget_usd", 10.0))
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()  # reflect now-clean / merged repos
+
         def _repo_item(self, r, unpushed=False):
             if unpushed:
                 # In the unpushed section, lead with the unpushed-commit count
@@ -778,7 +914,10 @@ def run_gui() -> int:
                          lambda *_: notify(self.window, *open_terminal(path)))
             self._action(sub, "Open Claude Code",
                          lambda *_: notify(self.window, *open_claude(path)))
-            push_label = "git push" + (f" (↑{r['ahead']})" if r["ahead"] else "")
+            commit_label = "git commit" + (f" ({r['count']})" if r["count"] else "")
+            self._action(sub, commit_label,
+                         lambda *_: notify(self.window, *open_commit(path)))
+            push_label = "git push" + (f" (+{r['ahead']})" if r["ahead"] else "")
             self._action(sub, push_label,
                          lambda *_: notify(self.window, *open_push(path)))
             if r.get("github"):
@@ -1106,6 +1245,142 @@ def run_gui() -> int:
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
             return False
 
+    class CommitAllDialog(Gtk.Dialog):
+        """Modal progress window for committing every dirty repo via Claude Code.
+
+        Like PushAllDialog, but the work is *bounded-parallel*: a
+        ThreadPoolExecutor runs at most ``commit_workers(...)`` claude processes
+        at once (RAM-derived) so the host isn't overloaded. Each repo's row goes
+        ·→↻→✓/✗; the progress bar tracks a completed counter (not a loop index,
+        since all futures are submitted at once but only W run). Close stays
+        disabled until every repo is done.
+        """
+
+        PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
+
+        def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd):
+            super().__init__(title="Commit all", transient_for=parent, modal=True)
+            self._repos = repos
+            self._timeout = timeout
+            self._budget = budget_usd
+            self._workers = commit_workers(ram_mb, cap)
+            self._marks = {}  # path → status Gtk.Label
+            self._done = False
+            self.add_button("Close", Gtk.ResponseType.CLOSE)
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
+            self.connect("delete-event", lambda *_: not self._done)
+            self.set_default_size(480, 380)
+
+            area = self.get_content_area()
+            area.set_border_width(10)
+            area.set_spacing(8)
+
+            self._summary = Gtk.Label(
+                label=f"Committing {len(repos)} repo(s), "
+                      f"{self._workers} at a time…", xalign=0)
+            area.pack_start(self._summary, False, False, 0)
+
+            self._bar = Gtk.ProgressBar()
+            self._bar.set_show_text(True)
+            self._bar.set_text(f"0 / {len(repos)}")
+            area.pack_start(self._bar, False, False, 0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            listbox = Gtk.ListBox()
+            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+            for r in repos:
+                row = Gtk.ListBoxRow()
+                box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                box.set_border_width(4)
+                mark = Gtk.Label(label=self.PENDING)
+                track = ""
+                if r["ahead"] or r["behind"]:
+                    track = f" ↑{r['ahead']}↓{r['behind']}"
+                name = Gtk.Label(
+                    label=f"{r['name']}  ({r['branch']}{track}, {r['count']})",
+                    xalign=0)
+                box.pack_start(mark, False, False, 0)
+                box.pack_start(name, True, True, 0)
+                row.add(box)
+                listbox.add(row)
+                self._marks[r["path"]] = mark
+            scroller.add(listbox)
+            area.pack_start(scroller, True, True, 0)
+
+            self._log = Gtk.TextView()
+            self._log.set_editable(False)
+            self._log.set_cursor_visible(False)
+            self._log.set_monospace(True)
+            self._log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            log_scroll = Gtk.ScrolledWindow()
+            log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                  Gtk.PolicyType.AUTOMATIC)
+            log_scroll.set_min_content_height(150)
+            log_scroll.add(self._log)
+            expander = Gtk.Expander(label="Details")
+            expander.add(log_scroll)
+            area.pack_start(expander, False, False, 0)
+
+            self.show_all()
+            self._start()
+
+        def _start(self):
+            from concurrent.futures import ThreadPoolExecutor
+
+            total = len(self._repos)
+
+            def one(r):
+                # Mark RUNNING here (inside the worker) so only genuinely-started
+                # repos flip from PENDING — futures are all submitted at once but
+                # only self._workers run concurrently.
+                GLib.idle_add(self._mark, r["path"], self.RUNNING)
+                return r, commit_repo(r["path"], self._timeout, self._budget)
+
+            def work():
+                ok = 0
+                done = 0
+                # finally: always re-enable Close — if the loop ever raised, the
+                # delete-event guard would otherwise leave the modal unclosable.
+                try:
+                    with ThreadPoolExecutor(max_workers=self._workers) as ex:
+                        from concurrent.futures import as_completed
+                        futures = [ex.submit(one, r) for r in self._repos]
+                        for fut in as_completed(futures):
+                            r, (success, output) = fut.result()
+                            ok += 1 if success else 0
+                            done += 1
+                            GLib.idle_add(self._step, done, total, r,
+                                          success, output)
+                finally:
+                    GLib.idle_add(self._finish, ok, total)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _mark(self, path, glyph):
+            self._marks[path].set_text(glyph)
+            return False
+
+        def _step(self, done, total, r, success, output):
+            self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
+            self._bar.set_fraction(done / total)
+            self._bar.set_text(f"{done} / {total}")
+            buf = self._log.get_buffer()
+            buf.insert(buf.get_end_iter(),
+                       f"=== {r['name']} ===\n{output or '(no output)'}\n\n")
+            return False
+
+        def _finish(self, ok, total):
+            failed = total - ok
+            msg = f"Committed {ok}/{total}"
+            if failed:
+                msg += f" · {failed} failed"
+            msg += " · see menu for final state"
+            self._summary.set_text(msg)
+            self._bar.set_fraction(1.0)
+            self._done = True
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
+            return False
+
     class ConfigDialog(Gtk.Dialog):
         def __init__(self, parent, config):
             super().__init__(title="Settings", transient_for=parent, modal=True)
@@ -1172,6 +1447,38 @@ def run_gui() -> int:
                 self._config.get("show_remoteless", True))
             grid.attach(self._chk_remoteless, 1, 8, 1, 1)
 
+            # "Commit all" tuning: how hard the headless batch may push the host.
+            adj_ram = Gtk.Adjustment(
+                value=self._config.get("commit_ram_mb", 2048),
+                lower=256, upper=65536, step_increment=256)
+            self._spin_commit_ram = Gtk.SpinButton(adjustment=adj_ram, digits=0)
+            row(9, "Commit RAM/proc (MB)", self._spin_commit_ram,
+                "RAM budgeted per claude process; workers = MemAvailable ÷ this")
+
+            adj_workers = Gtk.Adjustment(
+                value=self._config.get("commit_max_workers", 0),
+                lower=0, upper=64, step_increment=1)
+            self._spin_commit_workers = Gtk.SpinButton(
+                adjustment=adj_workers, digits=0)
+            row(11, "Commit max workers", self._spin_commit_workers,
+                "0 = auto (RAM- and CPU-derived); >0 caps concurrency")
+
+            adj_timeout = Gtk.Adjustment(
+                value=self._config.get("commit_timeout", 900),
+                lower=30, upper=7200, step_increment=30)
+            self._spin_commit_timeout = Gtk.SpinButton(
+                adjustment=adj_timeout, digits=0)
+            row(13, "Commit timeout (s)", self._spin_commit_timeout,
+                "per-repo cap before a claude run is killed")
+
+            adj_budget = Gtk.Adjustment(
+                value=self._config.get("commit_budget_usd", 10.0),
+                lower=0, upper=1000, step_increment=1)
+            self._spin_commit_budget = Gtk.SpinButton(
+                adjustment=adj_budget, digits=2)
+            row(15, "Commit budget ($/repo)", self._spin_commit_budget,
+                "max claude spend per repo (0 = unbounded)")
+
             return grid
 
         def _build_repos_tab(self):
@@ -1237,6 +1544,11 @@ def run_gui() -> int:
             cfg["refresh_interval"] = int(self._spin_interval.get_value())
             cfg["terminal"] = self._entry_terminal.get_text().strip()
             cfg["show_remoteless"] = self._chk_remoteless.get_active()
+            cfg["commit_ram_mb"] = int(self._spin_commit_ram.get_value())
+            cfg["commit_max_workers"] = int(self._spin_commit_workers.get_value())
+            cfg["commit_timeout"] = int(self._spin_commit_timeout.get_value())
+            cfg["commit_budget_usd"] = round(
+                self._spin_commit_budget.get_value(), 2)
             # Repos unchecked in the current scan list.
             shown_excluded = {
                 path for path, chk in self._repo_checks.items()
