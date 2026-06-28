@@ -631,6 +631,66 @@ def push_claude_argv(bin_path: str, budget_usd: float) -> list:
     return argv
 
 
+def commit_stream_argv(bin_path: str, budget_usd: float) -> list:
+    """argv for headless commit that streams live events (stream-json format)."""
+    argv = [bin_path, "-p", COMMIT_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    return argv
+
+
+def push_claude_stream_argv(bin_path: str, budget_usd: float) -> list:
+    """argv for headless claude-push that streams live events."""
+    argv = [bin_path, "-p", PUSH_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    return argv
+
+
+def _fmt_stream_event(line: str) -> str:
+    """Parse one stream-json line from claude into human-readable text.
+
+    Returns "" for events that should be silently skipped.
+    """
+    import json as _json
+    try:
+        d = _json.loads(line)
+    except (ValueError, TypeError):
+        return line  # pass non-JSON through verbatim
+    t = d.get("type", "")
+    if t == "assistant":
+        parts = []
+        for c in d.get("message", {}).get("content", []):
+            if c.get("type") == "text":
+                text = c["text"].strip()
+                if text:
+                    parts.append(text)
+            elif c.get("type") == "tool_use":
+                name = c.get("name", "?")
+                inp = c.get("input", {})
+                if isinstance(inp, dict):
+                    if "command" in inp:
+                        summary = inp["command"][:80]
+                    elif "file_path" in inp:
+                        summary = inp["file_path"]
+                    else:
+                        keys = list(inp.keys())
+                        summary = f"{keys[0]}=…" if keys else ""
+                else:
+                    summary = str(inp)[:80]
+                parts.append(f"► {name}: {summary}")
+        return "\n".join(parts) + "\n" if parts else ""
+    if t == "result":
+        if d.get("is_error"):
+            return f"✗ {d.get('result', 'error')[:120]}\n"
+        return f"✓ {d.get('result', 'Done')[:120]}\n"
+    return ""
+
+
 def push_claude_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
     """Run claude in *path* to push via headless Claude. Returns (ok, output). Never raises."""
     bin_path = shutil.which(CLAUDE_BIN)
@@ -1037,7 +1097,7 @@ def run_gui() -> int:
                 clean.set_sensitive(False)
                 menu.append(clean)
             else:
-                self._action(menu, f"Commit all ({len(dirty)})…",
+                self._action(menu, f"Commit all via Claude Code ({len(dirty)})…",
                              lambda *_: self._on_commit_all())
 
             # Unpushed repos get their own section (a repo can be both dirty and
@@ -1184,8 +1244,8 @@ def run_gui() -> int:
                 cfg.get("commit_timeout", 900),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                worker=push_claude_repo,
-                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}")
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
+                argv_fn=push_claude_stream_argv)
             dlg.run()
             dlg.destroy()
             self.refresh_menu()
@@ -1204,8 +1264,8 @@ def run_gui() -> int:
                 cfg.get("commit_timeout", 900),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                worker=push_claude_repo,
-                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}")
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
+                argv_fn=push_claude_stream_argv)
             dlg.run()
             dlg.destroy()
             self.refresh_menu()
@@ -1226,8 +1286,8 @@ def run_gui() -> int:
                 cfg.get("commit_timeout", 900),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                worker=push_claude_repo,
-                row_suffix=lambda rr: rr.get("branch", ""))
+                row_suffix=lambda rr: rr.get("branch", ""),
+                argv_fn=push_claude_stream_argv)
             dlg.run()
             dlg.destroy()
             self.refresh_menu()
@@ -1618,25 +1678,25 @@ def run_gui() -> int:
     class PushAllDialog(Gtk.Dialog):
         """Modal progress window for pushing every unpushed repo in sequence.
 
-        High-level: a progress bar plus one ✓/✗ row per repo. Detail (the raw
-        git output) lives in an expander shown open by default. Pushing starts on
-        open; the Close button stays disabled until every repo is done so the
-        dialog can't be dismissed mid-run.
+        Streaming git output appears live in the Details expander. A Stop button
+        lets the user abort mid-run (after a confirmation prompt); Close stays
+        disabled until every push has finished or been cancelled.
         """
 
-        PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
+        PENDING, RUNNING, OK, FAIL, STOPPED = "·", "↻", "✓", "✗", "⊘"
 
         def __init__(self, parent, repos):
             super().__init__(title="Push all", transient_for=parent, modal=True)
             self._repos = repos
             self._marks = {}  # path -> status Gtk.Label
             self._done = False
+            self._cancel = threading.Event()
+            self._proc = None
+            self._proc_lock = threading.Lock()
             self.add_button("Close", Gtk.ResponseType.CLOSE)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
-            # Block the window-manager close button until the run finishes, so
-            # the worker never updates widgets on a destroyed dialog.
             self.connect("delete-event", lambda *_: not self._done)
-            self.set_default_size(460, 360)
+            self.set_default_size(460, 400)
 
             area = self.get_content_area()
             area.set_border_width(10)
@@ -1683,79 +1743,189 @@ def run_gui() -> int:
             log_scroll.add(self._log)
             expander = Gtk.Expander(label="Details")
             expander.add(log_scroll)
-            expander.set_expanded(True)  # show output by default
+            expander.set_expanded(True)
             area.pack_start(expander, False, False, 0)
+
+            # Stop button added to the action area directly so it does NOT
+            # emit a dialog response (which would cause run() to return).
+            action_area = self.get_action_area()
+            self._stop_btn = Gtk.Button.new_with_label("Stop")
+            self._stop_btn.connect("clicked", self._on_stop)
+            action_area.pack_start(self._stop_btn, False, False, 0)
+            action_area.reorder_child(self._stop_btn, 0)
 
             self.show_all()
             self._start()
 
+        def _on_stop(self, *_):
+            dlg = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Stop pushing?")
+            dlg.format_secondary_text(
+                "The current push will be killed. Any partially-pushed refs "
+                "may be in an inconsistent state.")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.YES:
+                return
+            self._cancel.set()
+            with self._proc_lock:
+                if self._proc is not None:
+                    self._killpg(self._proc)
+            self._stop_btn.set_sensitive(False)
+
+        @staticmethod
+        def _killpg(proc):
+            import signal as _sig
+            try:
+                os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
         def _start(self):
+            env = {**os.environ, **_NONINTERACTIVE_GIT_ENV}
+
             def work():
                 ok = 0
                 total = len(self._repos)
                 for i, r in enumerate(self._repos, 1):
+                    if self._cancel.is_set():
+                        GLib.idle_add(self._step, i, total, r, False, True)
+                        continue
+
                     GLib.idle_add(self._mark, r["path"], self.RUNNING)
-                    success, output = push_repo(r["path"])
+                    GLib.idle_add(self._append_log, f"=== {r['name']} ===\n")
+
+                    if _current_upstream(r["path"], env):
+                        argv = ["git", "-C", r["path"], "push", "--progress"]
+                    else:
+                        remote = next(iter(_git(r["path"], "remote").split()), "")
+                        if not remote:
+                            GLib.idle_add(self._append_log, "no remote configured\n")
+                            GLib.idle_add(self._step, i, total, r, False, False)
+                            continue
+                        argv = ["git", "-C", r["path"], "push", "--progress",
+                                "-u", remote, "HEAD"]
+
+                    try:
+                        proc = subprocess.Popen(
+                            argv, env=env,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, start_new_session=True)
+                    except (OSError, subprocess.SubprocessError) as e:
+                        GLib.idle_add(self._append_log, f"Error: {e}\n")
+                        GLib.idle_add(self._step, i, total, r, False, False)
+                        continue
+
+                    with self._proc_lock:
+                        self._proc = proc
+
+                    try:
+                        for raw in proc.stdout:
+                            line = raw.replace("\r", "\n")
+                            GLib.idle_add(self._append_log, line)
+                            if self._cancel.is_set():
+                                self._killpg(proc)
+                                GLib.idle_add(self._append_log, "[Stopped]\n")
+                                break
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            self._killpg(proc)
+                            proc.wait()
+                        with self._proc_lock:
+                            self._proc = None
+
+                    cancelled = self._cancel.is_set()
+                    success = proc.returncode == 0 and not cancelled
                     ok += 1 if success else 0
-                    GLib.idle_add(self._step, i, total, r, success, output)
+                    GLib.idle_add(self._step, i, total, r, success, cancelled)
+
                 GLib.idle_add(self._finish, ok, total)
+
             threading.Thread(target=work, daemon=True).start()
 
         def _mark(self, path, glyph):
             self._marks[path].set_text(glyph)
             return False
 
-        def _step(self, i, total, r, success, output):
-            self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
+        def _append_log(self, text):
+            buf = self._log.get_buffer()
+            buf.insert(buf.get_end_iter(), text)
+            end = buf.get_end_iter()
+            self._log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+            return False
+
+        def _step(self, i, total, r, success, cancelled):
+            if cancelled:
+                self._marks[r["path"]].set_text(self.STOPPED)
+            else:
+                self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
             self._bar.set_fraction(i / total)
             self._bar.set_text(f"{i} / {total}")
-            buf = self._log.get_buffer()
-            buf.insert(buf.get_end_iter(),
-                       f"=== {r['name']} ===\n{output or '(no output)'}\n\n")
             return False
 
         def _finish(self, ok, total):
             failed = total - ok
-            msg = f"Pushed {ok}/{total}"
-            if failed:
-                msg += f" · {failed} failed (see Details)"
+            if self._cancel.is_set():
+                msg = f"Pushed {ok}/{total} · stopped"
+            elif failed:
+                msg = f"Pushed {ok}/{total} · {failed} failed (see Details)"
+            else:
+                msg = f"Pushed {ok}/{total}"
             self._summary.set_text(msg)
             self._bar.set_fraction(1.0)
             self._done = True
+            self._stop_btn.set_sensitive(False)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
             return False
 
     class CommitAllDialog(Gtk.Dialog):
-        """Modal progress window for committing every dirty repo via Claude Code.
+        """Modal progress window for committing/pushing repos via Claude Code.
 
-        Like PushAllDialog, but the work is *bounded-parallel*: a
-        ThreadPoolExecutor runs at most ``commit_workers(...)`` claude processes
-        at once (RAM-derived) so the host isn't overloaded. Each repo's row goes
-        ·→↻→✓/✗; the progress bar tracks a completed counter (not a loop index,
-        since all futures are submitted at once but only W run). Close stays
-        disabled until every repo is done.
+        Bounded-parallel (ThreadPoolExecutor, RAM-derived worker count). Each
+        repo's row goes ·→↻→✓/✗/⊘. Claude output streams live via stream-json
+        into the Details expander. A Stop button lets the user abort mid-run
+        (with a confirmation prompt) using process-group kill so no orphaned
+        children are left behind.
+
+        ``argv_fn(bin_path, budget_usd) → list`` selects the claude invocation.
+        Defaults to ``commit_stream_argv``; pass ``push_claude_stream_argv`` for
+        push-via-claude operations.
         """
 
-        PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
+        PENDING, RUNNING, OK, FAIL, STOPPED = "·", "↻", "✓", "✗", "⊘"
 
         def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd,
                      verb="Commit", verb_ing="Committing", verb_past="Committed",
-                     worker=None, row_suffix=None):
+                     worker=None, row_suffix=None, argv_fn=None):
             title = f"{verb} {repos[0]['name']}" if len(repos) == 1 else f"{verb} all"
             super().__init__(title=title, transient_for=parent, modal=True)
             self._repos = repos
             self._timeout = timeout
             self._budget = budget_usd
             self._verb_past = verb_past
-            self._worker = worker if worker is not None else commit_repo
+            self._argv_fn = argv_fn if argv_fn is not None else commit_stream_argv
             self._row_suffix = row_suffix
             self._workers = commit_workers(ram_mb, cap)
             self._marks = {}  # path → status Gtk.Label
             self._done = False
+            self._cancel = threading.Event()
+            self._procs = {}   # path → Popen
+            self._procs_lock = threading.Lock()
             self.add_button("Close", Gtk.ResponseType.CLOSE)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
             self.connect("delete-event", lambda *_: not self._done)
-            self.set_default_size(480, 380)
+            self.set_default_size(480, 420)
 
             area = self.get_content_area()
             area.set_border_width(10)
@@ -1785,9 +1955,9 @@ def run_gui() -> int:
                     row_label = f"{r['name']}  ({r['branch']}, {self._row_suffix(r)})"
                 else:
                     track = ""
-                    if r["ahead"] or r["behind"]:
+                    if r.get("ahead") or r.get("behind"):
                         track = f" ↑{r['ahead']}↓{r['behind']}"
-                    row_label = f"{r['name']}  ({r['branch']}{track}, {r['count']})"
+                    row_label = f"{r['name']}  ({r['branch']}{track}, {r.get('count', '')})"
                 name = Gtk.Label(label=row_label, xalign=0)
                 box.pack_start(mark, False, False, 0)
                 box.pack_start(name, True, True, 0)
@@ -1809,65 +1979,172 @@ def run_gui() -> int:
             log_scroll.add(self._log)
             expander = Gtk.Expander(label="Details")
             expander.add(log_scroll)
-            expander.set_expanded(True)  # show output by default
+            expander.set_expanded(True)
             area.pack_start(expander, False, False, 0)
+
+            action_area = self.get_action_area()
+            self._stop_btn = Gtk.Button.new_with_label("Stop")
+            self._stop_btn.connect("clicked", self._on_stop)
+            action_area.pack_start(self._stop_btn, False, False, 0)
+            action_area.reorder_child(self._stop_btn, 0)
 
             self.show_all()
             self._start()
 
+        def _on_stop(self, *_):
+            dlg = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Stop operation?")
+            dlg.format_secondary_text(
+                "Running repos will be killed. Any partial commits already "
+                "landed will remain. This cannot be undone.")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.YES:
+                return
+            self._cancel.set()
+            with self._procs_lock:
+                for proc in list(self._procs.values()):
+                    self._killpg(proc)
+            self._stop_btn.set_sensitive(False)
+
+        @staticmethod
+        def _killpg(proc):
+            import signal as _sig
+            try:
+                os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
         def _start(self):
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            import time as _time
 
             total = len(self._repos)
+            multi = total > 1  # prefix log lines with repo name when parallel
 
             def one(r):
-                # Mark RUNNING here (inside the worker) so only genuinely-started
-                # repos flip from PENDING — futures are all submitted at once but
-                # only self._workers run concurrently.
+                if self._cancel.is_set():
+                    return r, False
                 GLib.idle_add(self._mark, r["path"], self.RUNNING)
-                return r, self._worker(r["path"], self._timeout, self._budget)
+
+                bin_path = shutil.which(CLAUDE_BIN)
+                if not bin_path:
+                    GLib.idle_add(self._append_log,
+                                  f"[{r['name']}] claude not found on PATH\n")
+                    return r, False
+
+                argv = self._argv_fn(bin_path, self._budget)
+                GLib.idle_add(self._append_log, f"=== {r['name']} ===\n")
+
+                try:
+                    proc = subprocess.Popen(
+                        argv, cwd=r["path"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, start_new_session=True)
+                except (OSError, subprocess.SubprocessError) as e:
+                    GLib.idle_add(self._append_log,
+                                  f"[{r['name']}] Error: {e}\n")
+                    return r, False
+
+                with self._procs_lock:
+                    self._procs[r["path"]] = proc
+
+                # Kill after timeout regardless of whether we're reading.
+                timeout = self._timeout
+
+                def _kill_on_timeout():
+                    _time.sleep(timeout)
+                    if proc.poll() is None:
+                        self._killpg(proc)
+                        GLib.idle_add(
+                            self._append_log,
+                            f"[{r['name']}] timed out after {timeout}s\n")
+
+                threading.Thread(target=_kill_on_timeout, daemon=True).start()
+
+                try:
+                    for raw in proc.stdout:
+                        if self._cancel.is_set():
+                            self._killpg(proc)
+                            GLib.idle_add(self._append_log,
+                                          f"[{r['name']}] Stopped\n")
+                            break
+                        text = _fmt_stream_event(raw)
+                        if text:
+                            prefix = f"[{r['name']}] " if multi else ""
+                            GLib.idle_add(self._append_log, prefix + text)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self._killpg(proc)
+                        proc.wait()
+                    with self._procs_lock:
+                        self._procs.pop(r["path"], None)
+
+                ok = proc.returncode == 0 and not self._cancel.is_set()
+                return r, ok
 
             def work():
-                ok = 0
+                ok_count = 0
                 done = 0
-                # finally: always re-enable Close — if the loop ever raised, the
-                # delete-event guard would otherwise leave the modal unclosable.
                 try:
                     with ThreadPoolExecutor(max_workers=self._workers) as ex:
-                        from concurrent.futures import as_completed
                         futures = [ex.submit(one, r) for r in self._repos]
                         for fut in as_completed(futures):
-                            r, (success, output) = fut.result()
-                            ok += 1 if success else 0
+                            try:
+                                r, success = fut.result()
+                            except Exception:
+                                continue
+                            ok_count += 1 if success else 0
                             done += 1
-                            GLib.idle_add(self._step, done, total, r,
-                                          success, output)
+                            GLib.idle_add(self._step, done, total, r, success)
                 finally:
-                    GLib.idle_add(self._finish, ok, total)
+                    GLib.idle_add(self._finish, ok_count, total)
+
             threading.Thread(target=work, daemon=True).start()
 
         def _mark(self, path, glyph):
             self._marks[path].set_text(glyph)
             return False
 
-        def _step(self, done, total, r, success, output):
-            self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
+        def _append_log(self, text):
+            buf = self._log.get_buffer()
+            buf.insert(buf.get_end_iter(), text)
+            end = buf.get_end_iter()
+            self._log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+            return False
+
+        def _step(self, done, total, r, success):
+            if not success and self._cancel.is_set():
+                self._marks[r["path"]].set_text(self.STOPPED)
+            else:
+                self._marks[r["path"]].set_text(self.OK if success else self.FAIL)
             self._bar.set_fraction(done / total)
             self._bar.set_text(f"{done} / {total}")
-            buf = self._log.get_buffer()
-            buf.insert(buf.get_end_iter(),
-                       f"=== {r['name']} ===\n{output or '(no output)'}\n\n")
             return False
 
         def _finish(self, ok, total):
             failed = total - ok
             msg = f"{self._verb_past} {ok}/{total}"
-            if failed:
+            if self._cancel.is_set():
+                msg += " · stopped"
+            elif failed:
                 msg += f" · {failed} failed"
             msg += " · see menu for final state"
             self._summary.set_text(msg)
             self._bar.set_fraction(1.0)
             self._done = True
+            self._stop_btn.set_sensitive(False)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
             return False
 
