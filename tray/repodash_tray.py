@@ -77,6 +77,19 @@ STUCK_FINISH_PROMPT = (
     "4. Remove this worktree: git worktree remove {path}\n"
     "Work autonomously; never ask questions."
 )
+PUSH_PROMPT = (
+    "You are operating non-interactively in a git repository. Follow THIS "
+    "repository's own workflow rules (e.g. CLAUDE.md / CONTRIBUTING) strictly.\n"
+    "1. Run `git push`. If the current branch has no upstream, find the remote "
+    "with `git remote` and run `git push -u <remote> HEAD` instead.\n"
+    "2. If the push is rejected due to a non-fast-forward divergence, run "
+    "`git pull --rebase` and retry the push.\n"
+    "3. If the push is rejected by a pre-push hook, diagnose and fix the "
+    "underlying issue (run tests, linter, or formatter; edit files as needed), "
+    "then retry. Repeat until it succeeds.\n"
+    "4. Do NOT commit new changes — only push what is already committed.\n"
+    "Work autonomously; never ask questions."
+)
 # Preference order; first one found on PATH wins unless REPODASH_TERMINAL is set.
 TERMINAL_PREFERENCE = ("ptyxis", "gnome-terminal", "kgx", "ghostty", "xterm")
 
@@ -587,6 +600,40 @@ def push_repo(path: str):
     return out.returncode == 0, (out.stdout + out.stderr).strip()
 
 
+def push_claude_argv(bin_path: str, budget_usd: float) -> list:
+    """argv to run claude headlessly with PUSH_PROMPT, bounded by a $ budget."""
+    argv = [bin_path, "-p", PUSH_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "json"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    return argv
+
+
+def push_claude_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
+    """Run claude in *path* to push via headless Claude. Returns (ok, output). Never raises."""
+    bin_path = shutil.which(CLAUDE_BIN)
+    if not bin_path:
+        return False, "claude not found on PATH"
+    try:
+        out = subprocess.run(push_claude_argv(bin_path, budget_usd), cwd=path,
+                             stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+    msg = (out.stdout or out.stderr).strip()
+    try:
+        import json
+        doc = json.loads(out.stdout)
+        if isinstance(doc, dict) and doc.get("result"):
+            msg = str(doc["result"]).strip()
+    except ValueError:
+        pass
+    return out.returncode == 0, msg
+
+
 # ── batch commit (headless Claude Code) ──────────────────────────────────────
 def _mem_available_mb() -> int:
     """Available RAM in MB from /proc/meminfo, or 0 if unknown (non-Linux)."""
@@ -976,6 +1023,8 @@ def run_gui() -> int:
                     menu.append(self._repo_item(r, unpushed=True))
                 self._action(menu, f"Push all ({len(unpushed)})…",
                              lambda *_: self._on_push_all())
+                self._action(menu, f"Push all via Claude Code ({len(unpushed)})…",
+                             lambda *_: self._on_push_claude_all())
 
             stuck_repos = [r for r in self.repos
                            if r.get("stale_worktrees", {}).get("stuck")]
@@ -1003,6 +1052,7 @@ def run_gui() -> int:
                          lambda *_: self.show_dashboard())
             self._action(menu, "Refresh now", lambda *_: self.refresh_menu())
             self._action(menu, "Settings…", lambda *_: self._on_settings())
+            self._action(menu, "Help…", lambda *_: self._on_help())
 
             start_item = Gtk.CheckMenuItem(label="Start on login")
             start_item.set_active(autostart_enabled())  # set before connecting
@@ -1085,6 +1135,70 @@ def run_gui() -> int:
             dlg.destroy()
             self.refresh_menu()  # reflect now-clean / merged repo
 
+        def _on_push_claude_repo(self, r):
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = CommitAllDialog(
+                parent, [r],
+                cfg.get("commit_ram_mb", 2048),
+                cfg.get("commit_max_workers", 0),
+                cfg.get("commit_timeout", 900),
+                cfg.get("commit_budget_usd", 10.0),
+                verb="Push", verb_ing="Pushing", verb_past="Pushed",
+                worker=push_claude_repo,
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}")
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()
+
+        def _on_push_claude_all(self):
+            repos = [r for r in self.repos
+                     if r["has_remote"] and r["unpushed"] > 0]
+            if not repos:
+                return
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = CommitAllDialog(
+                parent, repos,
+                cfg.get("commit_ram_mb", 2048),
+                cfg.get("commit_max_workers", 0),
+                cfg.get("commit_timeout", 900),
+                cfg.get("commit_budget_usd", 10.0),
+                verb="Push", verb_ing="Pushing", verb_past="Pushed",
+                worker=push_claude_repo,
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}")
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()
+
+        def _on_wt_push_claude(self, wt, repo):
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            r = {
+                "path": wt["path"],
+                "name": wt.get("branch", os.path.basename(wt["path"])),
+                "branch": wt.get("branch", ""),
+                "unpushed": 0,
+            }
+            dlg = CommitAllDialog(
+                parent, [r],
+                cfg.get("commit_ram_mb", 2048),
+                cfg.get("commit_max_workers", 0),
+                cfg.get("commit_timeout", 900),
+                cfg.get("commit_budget_usd", 10.0),
+                verb="Push", verb_ing="Pushing", verb_past="Pushed",
+                worker=push_claude_repo,
+                row_suffix=lambda rr: rr.get("branch", ""))
+            dlg.run()
+            dlg.destroy()
+            self.refresh_menu()
+
+        def _on_help(self):
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = HelpDialog(parent)
+            dlg.run()
+            dlg.destroy()
+
         def _repo_item(self, r, unpushed=False):
             if unpushed:
                 # In the unpushed section, lead with the unpushed-commit count
@@ -1111,6 +1225,9 @@ def run_gui() -> int:
             push_label = "git push" + (f" (+{r['ahead']})" if r["ahead"] else "")
             self._action(sub, push_label,
                          lambda *_: notify(self.window, *open_push(path)))
+            if r.get("has_remote") and r.get("unpushed", 0) > 0:
+                self._action(sub, "Push via Claude Code…",
+                             lambda *_, r=r: self._on_push_claude_repo(r))
             if r.get("github"):
                 self._action(sub, "Open GitHub",
                              lambda *_: notify(self.window, *open_github(path)))
@@ -1150,6 +1267,8 @@ def run_gui() -> int:
                 if ahead:
                     self._action(sub, f"git push (+{ahead})",
                                  lambda *_, p=path: notify(self.window, *open_push(p)))
+                    self._action(sub, "Push via Claude Code…",
+                                 lambda *_, w=wt, rr=r: self._on_wt_push_claude(w, rr))
                 sub.append(Gtk.SeparatorMenuItem())
                 self._action(sub, "Finish & merge via Claude Code…",
                              lambda *_, w=wt, rr=r: self._on_wt_finish(w, rr))
@@ -1538,14 +1657,17 @@ def run_gui() -> int:
 
         PENDING, RUNNING, OK, FAIL = "·", "↻", "✓", "✗"
 
-        def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd):
-            # Title reflects scope: the single-repo path (per-repo submenu) would
-            # be misleading under "Commit all", so name the one repo instead.
-            title = f"Commit {repos[0]['name']}" if len(repos) == 1 else "Commit all"
+        def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd,
+                     verb="Commit", verb_ing="Committing", verb_past="Committed",
+                     worker=None, row_suffix=None):
+            title = f"{verb} {repos[0]['name']}" if len(repos) == 1 else f"{verb} all"
             super().__init__(title=title, transient_for=parent, modal=True)
             self._repos = repos
             self._timeout = timeout
             self._budget = budget_usd
+            self._verb_past = verb_past
+            self._worker = worker if worker is not None else commit_repo
+            self._row_suffix = row_suffix
             self._workers = commit_workers(ram_mb, cap)
             self._marks = {}  # path → status Gtk.Label
             self._done = False
@@ -1558,8 +1680,8 @@ def run_gui() -> int:
             area.set_border_width(10)
             area.set_spacing(8)
 
-            summary = (f"Committing {repos[0]['name']}…" if len(repos) == 1
-                       else f"Committing {len(repos)} repo(s), "
+            summary = (f"{verb_ing} {repos[0]['name']}…" if len(repos) == 1
+                       else f"{verb_ing} {len(repos)} repo(s), "
                             f"{self._workers} at a time…")
             self._summary = Gtk.Label(label=summary, xalign=0)
             area.pack_start(self._summary, False, False, 0)
@@ -1578,12 +1700,14 @@ def run_gui() -> int:
                 box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 box.set_border_width(4)
                 mark = Gtk.Label(label=self.PENDING)
-                track = ""
-                if r["ahead"] or r["behind"]:
-                    track = f" ↑{r['ahead']}↓{r['behind']}"
-                name = Gtk.Label(
-                    label=f"{r['name']}  ({r['branch']}{track}, {r['count']})",
-                    xalign=0)
+                if self._row_suffix is not None:
+                    row_label = f"{r['name']}  ({r['branch']}, {self._row_suffix(r)})"
+                else:
+                    track = ""
+                    if r["ahead"] or r["behind"]:
+                        track = f" ↑{r['ahead']}↓{r['behind']}"
+                    row_label = f"{r['name']}  ({r['branch']}{track}, {r['count']})"
+                name = Gtk.Label(label=row_label, xalign=0)
                 box.pack_start(mark, False, False, 0)
                 box.pack_start(name, True, True, 0)
                 row.add(box)
@@ -1620,7 +1744,7 @@ def run_gui() -> int:
                 # repos flip from PENDING — futures are all submitted at once but
                 # only self._workers run concurrently.
                 GLib.idle_add(self._mark, r["path"], self.RUNNING)
-                return r, commit_repo(r["path"], self._timeout, self._budget)
+                return r, self._worker(r["path"], self._timeout, self._budget)
 
             def work():
                 ok = 0
@@ -1656,7 +1780,7 @@ def run_gui() -> int:
 
         def _finish(self, ok, total):
             failed = total - ok
-            msg = f"Committed {ok}/{total}"
+            msg = f"{self._verb_past} {ok}/{total}"
             if failed:
                 msg += f" · {failed} failed"
             msg += " · see menu for final state"
@@ -1794,7 +1918,7 @@ def run_gui() -> int:
 
             def section(title):
                 lbl = Gtk.Label(xalign=0.0)
-                lbl.set_markup(f"<b>{title}</b>")
+                lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
                 vbox.pack_start(lbl, False, False, 0)
 
             def spin_row(label_text, key, default, lo, hi, step, hint=None):
@@ -1847,7 +1971,7 @@ def run_gui() -> int:
 
             def section(title):
                 lbl = Gtk.Label(xalign=0.0)
-                lbl.set_markup(f"<b>{title}</b>")
+                lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
                 vbox.pack_start(lbl, False, False, 0)
 
             def spin_row(label_text, key, default, lo, hi, step,
@@ -1954,6 +2078,118 @@ def run_gui() -> int:
             not_shown = old_excluded - set(self._repo_checks.keys())
             cfg["excluded_repos"] = sorted(shown_excluded | not_shown)
             return cfg
+
+    class HelpDialog(Gtk.Dialog):
+        _CONTENT = [
+            ("h", "repodash Workflow Guide"),
+            ("p", "repodash watches your git repos and surfaces work that needs "
+                  "attention. The tray icon shows a count of dirty repos; click "
+                  "an entry to act on it."),
+            ("h2", "Dirty repos (changed files)"),
+            ("p", "Repos with uncommitted changes appear first, marked with ●."),
+            ("item", "Open terminal",
+             "Opens a terminal in the repo directory."),
+            ("item", "Open Claude Code",
+             "Opens Claude Code interactively in a terminal."),
+            ("item", "git commit (N)",
+             "Opens a terminal with your editor so you can write the commit "
+             "message yourself. Good for quick, focused commits."),
+            ("item", "Commit via Claude Code…",
+             "Claude Code inspects the diff, groups changes into logical commits "
+             "with appropriate messages, fixes any pre-commit hook failures, then "
+             "optionally merges the branch into main. A progress dialog shows "
+             "per-repo status."),
+            ("h2", "Unpushed repos"),
+            ("p", "Repos with local commits not yet on a remote appear in the "
+                  "Unpushed section."),
+            ("item", "git push",
+             "Opens a terminal and runs git push. Use this when you need to "
+             "enter a passphrase or watch the output interactively."),
+            ("item", "Push via Claude Code…",
+             "Claude Code runs git push, handles non-fast-forward divergence "
+             "(pull --rebase + retry), and fixes pre-push hook failures. Use "
+             "when a plain push fails and you want errors fixed automatically."),
+            ("h2", "Stale worktrees"),
+            ("p", "Extra git worktrees (from git worktree add) that have gone "
+                  "quiet appear as ⚠ Stuck or ⏸ Idle sections."),
+            ("item", "⚠ Stuck",
+             "A worktree with uncommitted changes sitting idle longer than the "
+             "configured threshold. Use “Finish & merge via Claude Code” "
+             "to commit, merge into main, and remove the worktree automatically."),
+            ("item", "⏸ Idle",
+             "A clean worktree with no ahead commits sitting idle. Use "
+             "“Close via Claude Code” to review and remove it, or "
+             "“Remove worktree” for an immediate direct delete."),
+            ("h2", "Dashboard"),
+            ("p", "Lists every repo with full status. Open with "
+                  "“Show dashboard…” or by re-launching the tray. "
+                  "Each row has buttons for Terminal, Claude Code, Push, GitHub, "
+                  "and Open folder."),
+            ("h2", "Settings"),
+            ("item", "General",
+             "Scan root directory, depth, refresh interval, terminal."),
+            ("item", "Git",
+             "Show/hide remoteless repos; stale-worktree thresholds."),
+            ("item", "Repositories",
+             "Per-repo include/exclude list. Rescan after changing the root."),
+            ("item", "Claude Code",
+             "RAM/worker/timeout/budget limits for headless Claude runs; "
+             "customisable prompts for worktree close and finish actions. "
+             "Placeholders {path}, {branch}, {repo_path} are substituted at "
+             "runtime."),
+        ]
+
+        def __init__(self, parent):
+            super().__init__(title="repodash — Help",
+                             transient_for=parent, modal=True)
+            self.add_button("Close", Gtk.ResponseType.CLOSE)
+            self.set_default_size(580, 500)
+
+            area = self.get_content_area()
+            area.set_border_width(0)
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+            tv = Gtk.TextView()
+            tv.set_editable(False)
+            tv.set_cursor_visible(False)
+            tv.set_wrap_mode(Gtk.WrapMode.WORD)
+            tv.set_left_margin(16)
+            tv.set_right_margin(16)
+            tv.set_top_margin(12)
+            tv.set_bottom_margin(12)
+
+            buf = tv.get_buffer()
+            t_h = buf.create_tag("h", weight=700, scale=1.2,
+                                 pixels_above_lines=4, pixels_below_lines=4)
+            t_h2 = buf.create_tag("h2", weight=700, pixels_above_lines=10)
+            t_bold = buf.create_tag("bold", weight=700)
+            t_dim = buf.create_tag("dim", foreground="#888888")
+
+            def ins(text, *tags):
+                end = buf.get_end_iter()
+                active = [t for t in tags if t is not None]
+                if active:
+                    buf.insert_with_tags(end, text, *active)
+                else:
+                    buf.insert(end, text)
+
+            for entry in self._CONTENT:
+                kind = entry[0]
+                if kind == "h":
+                    ins(entry[1] + "\n", t_h)
+                elif kind == "h2":
+                    ins("\n" + entry[1] + "\n", t_h2)
+                elif kind == "p":
+                    ins(entry[1] + "\n")
+                elif kind == "item":
+                    ins("  " + entry[1], t_bold)
+                    ins("\n    " + entry[2] + "\n", t_dim)
+
+            scroller.add(tv)
+            area.pack_start(scroller, True, True, 0)
+            self.show_all()
 
     app = TrayApp()
     return app.run([sys.argv[0]])

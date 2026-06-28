@@ -541,6 +541,40 @@ class CommitRepoTest(unittest.TestCase):
         self.assertIn("claude not found", out)
 
 
+class PushClaudeArgvTest(unittest.TestCase):
+    def test_contains_headless_flags(self):
+        argv = tray.push_claude_argv("/x/claude", 10.0)
+        self.assertEqual(argv[0], "/x/claude")
+        self.assertIn("-p", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--output-format", argv)
+        self.assertIn("json", argv)
+        self.assertIn("--max-budget-usd", argv)
+        self.assertIn("10.0", argv)
+        self.assertEqual(argv[argv.index("-p") + 1], tray.PUSH_PROMPT)
+
+    def test_zero_budget_omits_flag(self):
+        argv = tray.push_claude_argv("/x/claude", 0)
+        self.assertNotIn("--max-budget-usd", argv)
+
+    def test_prompt_differs_from_commit_prompt(self):
+        self.assertNotEqual(tray.PUSH_PROMPT, tray.COMMIT_PROMPT)
+        self.assertIn("git push", tray.PUSH_PROMPT)
+        self.assertIn("pull --rebase", tray.PUSH_PROMPT)
+
+
+class PushClaudeRepoTest(unittest.TestCase):
+    def test_missing_claude_reports_clearly(self):
+        orig = tray.shutil.which
+        tray.shutil.which = lambda _: None
+        try:
+            ok, out = tray.push_claude_repo("/tmp", timeout=5)
+        finally:
+            tray.shutil.which = orig
+        self.assertFalse(ok)
+        self.assertIn("claude not found", out)
+
+
 class StaleWorktreeTest(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_GIT, "git not available")
