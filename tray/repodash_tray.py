@@ -24,6 +24,7 @@ layer so the pure helpers below import cleanly anywhere (and in the test suite).
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,28 @@ COMMIT_PROMPT = (
     "4. Do NOT push and do not contact any remote.\n"
     "Work autonomously; never ask questions."
 )
+# Default prompts for the worktree Claude Code actions (shown in Settings → Claude Code).
+# {path}, {branch}, {repo_path} are substituted at runtime.
+IDLE_CLOSE_PROMPT = (
+    "You are operating non-interactively in a git worktree.\n"
+    "Worktree: {path}  Branch: {branch}\n"
+    "This worktree has no uncommitted changes and has been idle.\n"
+    "1. Inspect the branch history and any open todos or roadmap items.\n"
+    "2. If the work is complete or no longer needed, remove the worktree:\n"
+    "   git worktree remove {path}\n"
+    "3. If the branch still needs to be merged or reviewed, report why and do NOT remove it.\n"
+    "Work autonomously; never ask questions."
+)
+STUCK_FINISH_PROMPT = (
+    "You are operating non-interactively in a git worktree.\n"
+    "Worktree: {path}  Branch: {branch}\n"
+    "This worktree has uncommitted changes sitting idle.\n"
+    "1. Review all changes (git status, git diff).\n"
+    "2. Commit them with appropriate messages, fixing any pre-commit hook failures.\n"
+    "3. Merge branch {branch} into local main (unless the repo's own rules forbid it).\n"
+    "4. Remove this worktree: git worktree remove {path}\n"
+    "Work autonomously; never ask questions."
+)
 # Preference order; first one found on PATH wins unless REPODASH_TERMINAL is set.
 TERMINAL_PREFERENCE = ("ptyxis", "gnome-terminal", "kgx", "ghostty", "xterm")
 
@@ -81,6 +104,8 @@ CONFIG_DEFAULTS = {
     "stale_worktree_idle_hours": 24,
     "stale_worktree_stuck_hours": 12,
     "show_stale_worktrees": True,
+    "worktree_idle_close_prompt": "",    # empty → use built-in IDLE_CLOSE_PROMPT
+    "worktree_stuck_finish_prompt": "",  # empty → use built-in STUCK_FINISH_PROMPT
 }
 
 
@@ -492,6 +517,26 @@ def open_commit(path: str):
     return open_terminal(path, "git add -A && git commit")
 
 
+def open_wt_claude(wt_path: str, prompt_text: str):
+    """Open a terminal running claude headlessly with *prompt_text* in *wt_path*."""
+    bin_path = shutil.which(CLAUDE_BIN)
+    if not bin_path:
+        return False, "claude not found on PATH"
+    cmd = f"{bin_path} --dangerously-skip-permissions -p {shlex.quote(prompt_text)}"
+    return open_terminal(wt_path, cmd)
+
+
+def remove_worktree(repo_path: str, wt_path: str):
+    """Remove a git worktree directly (no Claude). Returns (ok, message)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_path, "worktree", "remove", wt_path],
+            capture_output=True, text=True, timeout=15)
+        return out.returncode == 0, (out.stdout + out.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
 # Environment that disables every interactive auth prompt, so a push that would
 # otherwise block on credentials fails fast instead of hanging the progress
 # dialog. BatchMode still lets a loaded ssh-agent / credential helper succeed.
@@ -883,7 +928,9 @@ def run_gui() -> int:
                 # (which runs on the GTK thread) never blocks on git. Both the
                 # dirty and unpushed sections expose an "Open GitHub" action.
                 for r in repos:
-                    if r["dirty"] or (r["has_remote"] and r["unpushed"]):
+                    sw = r.get("stale_worktrees") or {}
+                    if (r["dirty"] or (r["has_remote"] and r["unpushed"])
+                            or sw.get("stuck") or sw.get("idle")):
                         r["github"] = github_url(r["path"])
                 GLib.idle_add(self._apply_repos, repos)
             threading.Thread(target=work, daemon=True).start()
@@ -1072,7 +1119,7 @@ def run_gui() -> int:
             item.set_submenu(sub)
             return item
 
-        def _worktree_item(self, wt, severity):
+        def _worktree_item(self, wt, severity, r):
             age_str = _format_age(wt["last_commit_age_hours"])
             if severity == "stuck":
                 label = f"  {wt['branch']}  {age_str} ago (dirty)"
@@ -1082,15 +1129,66 @@ def run_gui() -> int:
             item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
             path = wt["path"]
+            repo_path = r["path"]
+
             self._action(sub, "Open terminal",
                          lambda *_, p=path: notify(self.window, *open_terminal(p)))
             self._action(sub, "Open Claude Code",
                          lambda *_, p=path: notify(self.window, *open_claude(p)))
+
+            if severity == "stuck":
+                count = len([ln for ln in
+                             _git(path, "status", "--porcelain").splitlines()
+                             if ln.strip()])
+                commit_label = f"git commit ({count})" if count else "git commit"
+                self._action(sub, commit_label,
+                             lambda *_, p=path: notify(self.window, *open_commit(p)))
+                ahead = wt.get("ahead", 0) or (
+                    int(_git(path, "rev-list", "--count",
+                             "HEAD", "--not", "--remotes").strip() or "0"))
+                if ahead:
+                    self._action(sub, f"git push (+{ahead})",
+                                 lambda *_, p=path: notify(self.window, *open_push(p)))
+                sub.append(Gtk.SeparatorMenuItem())
+                self._action(sub, "Finish & merge via Claude Code…",
+                             lambda *_, w=wt, rr=r: self._on_wt_finish(w, rr))
+            else:
+                sub.append(Gtk.SeparatorMenuItem())
+                self._action(sub, "Close via Claude Code…",
+                             lambda *_, w=wt, rr=r: self._on_wt_close(w, rr))
+                self._action(sub, "Remove worktree",
+                             lambda *_, w=wt, rp=repo_path: self._on_wt_remove(w, rp))
+
+            if r.get("github"):
+                sub.append(Gtk.SeparatorMenuItem())
+                self._action(sub, "Open GitHub",
+                             lambda *_: notify(self.window, *open_github(repo_path)))
+            sub.append(Gtk.SeparatorMenuItem())
             self._action(sub, "Open folder",
                          lambda *_, p=path: notify(self.window, *open_folder(p)))
             self._action(sub, "Copy path", lambda *_, p=path: self._copy(p))
             item.set_submenu(sub)
             return item
+
+        def _on_wt_close(self, wt, r):
+            cfg = self.config
+            tmpl = cfg.get("worktree_idle_close_prompt") or IDLE_CLOSE_PROMPT
+            prompt = tmpl.format(path=wt["path"], branch=wt["branch"],
+                                 repo_path=r["path"])
+            notify(self.window, *open_wt_claude(wt["path"], prompt))
+
+        def _on_wt_finish(self, wt, r):
+            cfg = self.config
+            tmpl = cfg.get("worktree_stuck_finish_prompt") or STUCK_FINISH_PROMPT
+            prompt = tmpl.format(path=wt["path"], branch=wt["branch"],
+                                 repo_path=r["path"])
+            notify(self.window, *open_wt_claude(wt["path"], prompt))
+
+        def _on_wt_remove(self, wt, repo_path):
+            ok, msg = remove_worktree(repo_path, wt["path"])
+            notify(self.window, ok, msg or f"Removed {wt['branch']}")
+            if ok:
+                self.refresh_menu()
 
         def _stale_repo_item(self, r, severity):
             wt_list = r["stale_worktrees"][severity]
@@ -1105,7 +1203,7 @@ def run_gui() -> int:
             item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
             for wt in wt_list:
-                sub.append(self._worktree_item(wt, severity))
+                sub.append(self._worktree_item(wt, severity, r))
             item.set_submenu(sub)
             return item
 
@@ -1582,8 +1680,10 @@ def run_gui() -> int:
                                  Gtk.Label(label="General"))
             notebook.append_page(self._build_repos_tab(),
                                  Gtk.Label(label="Repositories"))
+            notebook.append_page(self._build_claude_tab(),
+                                 Gtk.Label(label="Claude Code"))
             self.get_content_area().pack_start(notebook, True, True, 0)
-            self.set_default_size(520, 440)
+            self.set_default_size(520, 520)
             self.show_all()
 
         def _build_general_tab(self):
@@ -1665,26 +1765,6 @@ def run_gui() -> int:
             row(15, "Commit budget ($/repo)", self._spin_commit_budget,
                 "max claude spend per repo (0 = unbounded)")
 
-            self._chk_show_stale = Gtk.CheckButton(
-                label="Detect stale worktrees")
-            self._chk_show_stale.set_active(
-                self._config.get("show_stale_worktrees", True))
-            grid.attach(self._chk_show_stale, 1, 17, 1, 1)
-
-            adj_idle = Gtk.Adjustment(
-                value=self._config.get("stale_worktree_idle_hours", 24),
-                lower=1, upper=8760, step_increment=1)
-            self._spin_idle_hours = Gtk.SpinButton(adjustment=adj_idle, digits=0)
-            row(18, "Idle threshold (h)", self._spin_idle_hours,
-                "clean+no-ahead worktree older than this is idle (⏸)")
-
-            adj_stuck = Gtk.Adjustment(
-                value=self._config.get("stale_worktree_stuck_hours", 12),
-                lower=1, upper=8760, step_increment=1)
-            self._spin_stuck_hours = Gtk.SpinButton(adjustment=adj_stuck, digits=0)
-            row(20, "Stuck threshold (h)", self._spin_stuck_hours,
-                "dirty worktree older than this is stuck (⚠)")
-
             return grid
 
         def _build_repos_tab(self):
@@ -1743,6 +1823,83 @@ def run_gui() -> int:
         def _on_rescan(self, *_):
             self._populate_repo_list()
 
+        def _build_claude_tab(self):
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            vbox.set_border_width(12)
+
+            def section(title):
+                lbl = Gtk.Label(xalign=0.0)
+                lbl.set_markup(f"<b>{title}</b>")
+                vbox.pack_start(lbl, False, False, 0)
+
+            def spin_row(label_text, key, default, lo, hi, step, hint=None):
+                hbox = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
+                hbox.pack_start(lbl, False, False, 0)
+                adj = Gtk.Adjustment(value=self._config.get(key, default),
+                                     lower=lo, upper=hi, step_increment=step)
+                spin = Gtk.SpinButton(adjustment=adj, digits=0)
+                hbox.pack_start(spin, False, False, 0)
+                if hint:
+                    hl = Gtk.Label(label=hint, xalign=0.0)
+                    hl.get_style_context().add_class("dim-label")
+                    hbox.pack_start(hl, False, False, 0)
+                vbox.pack_start(hbox, False, False, 0)
+                return spin
+
+            def prompt_row(label_text, key, default_text):
+                lbl = Gtk.Label(label=label_text, xalign=0.0)
+                vbox.pack_start(lbl, False, False, 0)
+                sw = Gtk.ScrolledWindow()
+                sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+                sw.set_size_request(-1, 100)
+                tv = Gtk.TextView()
+                tv.set_wrap_mode(Gtk.WrapMode.WORD)
+                buf = tv.get_buffer()
+                saved = self._config.get(key, "")
+                buf.set_text(saved if saved else default_text)
+                sw.add(tv)
+                vbox.pack_start(sw, True, True, 0)
+                return buf
+
+            # ── Detection ──────────────────────────────────────────────────
+            section("Stale worktree detection")
+            self._chk_show_stale = Gtk.CheckButton(label="Enable stale worktree detection")
+            self._chk_show_stale.set_active(
+                self._config.get("show_stale_worktrees", True))
+            vbox.pack_start(self._chk_show_stale, False, False, 0)
+
+            self._spin_idle_hours = spin_row(
+                "Idle threshold (h):", "stale_worktree_idle_hours", 24, 1, 8760, 1,
+                "clean+no-ahead worktrees older than this are idle (⏸)")
+            self._spin_stuck_hours = spin_row(
+                "Stuck threshold (h):", "stale_worktree_stuck_hours", 12, 1, 8760, 1,
+                "dirty worktrees older than this are stuck (⚠)")
+
+            # ── Prompts ────────────────────────────────────────────────────
+            section("⏸  Idle worktree — close prompt")
+            hint_idle = Gtk.Label(
+                label="Placeholders: {path}  {branch}  {repo_path}",
+                xalign=0.0)
+            hint_idle.get_style_context().add_class("dim-label")
+            vbox.pack_start(hint_idle, False, False, 0)
+            self._buf_idle_prompt = prompt_row(
+                "", "worktree_idle_close_prompt", IDLE_CLOSE_PROMPT)
+
+            section("⚠  Stuck worktree — finish & merge prompt")
+            hint_stuck = Gtk.Label(
+                label="Placeholders: {path}  {branch}  {repo_path}",
+                xalign=0.0)
+            hint_stuck.get_style_context().add_class("dim-label")
+            vbox.pack_start(hint_stuck, False, False, 0)
+            self._buf_stuck_prompt = prompt_row(
+                "", "worktree_stuck_finish_prompt", STUCK_FINISH_PROMPT)
+
+            outer = Gtk.ScrolledWindow()
+            outer.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            outer.add(vbox)
+            return outer
+
         def get_config(self) -> dict:
             cfg = dict(self._config)
             cfg["base_dir"] = self._entry_base.get_text().strip()
@@ -1758,6 +1915,14 @@ def run_gui() -> int:
             cfg["show_stale_worktrees"] = self._chk_show_stale.get_active()
             cfg["stale_worktree_idle_hours"] = int(self._spin_idle_hours.get_value())
             cfg["stale_worktree_stuck_hours"] = int(self._spin_stuck_hours.get_value())
+            start, end = self._buf_idle_prompt.get_bounds()
+            idle_text = self._buf_idle_prompt.get_text(start, end, False).strip()
+            cfg["worktree_idle_close_prompt"] = (
+                "" if idle_text == IDLE_CLOSE_PROMPT.strip() else idle_text)
+            start, end = self._buf_stuck_prompt.get_bounds()
+            stuck_text = self._buf_stuck_prompt.get_text(start, end, False).strip()
+            cfg["worktree_stuck_finish_prompt"] = (
+                "" if stuck_text == STUCK_FINISH_PROMPT.strip() else stuck_text)
             # Repos unchecked in the current scan list.
             shown_excluded = {
                 path for path, chk in self._repo_checks.items()
