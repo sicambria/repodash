@@ -337,10 +337,14 @@ def scan_worktrees(repo_path: str, idle_hours: float, stuck_hours: float) -> dic
     Each entry: {path, branch, last_commit_age_hours, behind, dirty}.
 
     Stuck:  dirty == True  AND last_commit_age_hours > stuck_hours
-    Merged: dirty == False AND ahead == 0 AND age > idle_hours
+    Merged: dirty == False AND age > idle_hours
             AND rev-list HEAD --not <parent> == 0  (no unique commits)
-    Idle:   dirty == False AND ahead == 0 AND age > idle_hours
+    Idle:   dirty == False AND age > idle_hours
             AND rev-list HEAD --not <parent> > 0  (unique commits not yet in parent)
+
+    Note: "ahead" (relative to remote tracking) is intentionally not used as a
+    gate — push state is orthogonal to whether work is unique vs absorbed in the
+    parent branch.
     """
     import time
     result: dict = {"stuck": [], "idle": [], "merged": []}
@@ -376,7 +380,7 @@ def scan_worktrees(repo_path: str, idle_hours: float, stuck_hours: float) -> dic
         }
         if dirty and age_hours > stuck_hours:
             result["stuck"].append(entry)
-        elif not dirty and ahead == 0 and age_hours > idle_hours:
+        elif not dirty and age_hours > idle_hours:
             unmerged = _git(wt_path, "rev-list", "--count",
                             "HEAD", "--not", parent_branch).strip()
             if unmerged == "0":
