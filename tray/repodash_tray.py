@@ -1918,6 +1918,8 @@ def run_gui() -> int:
 
             def section(title):
                 lbl = Gtk.Label(xalign=0.0)
+                # markup_escape_text is mandatory: set_markup silently renders an
+                # empty label on invalid Pango XML (e.g. a bare & in a title string).
                 lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
                 vbox.pack_start(lbl, False, False, 0)
 
@@ -1971,6 +1973,8 @@ def run_gui() -> int:
 
             def section(title):
                 lbl = Gtk.Label(xalign=0.0)
+                # markup_escape_text is mandatory: set_markup silently renders an
+                # empty label on invalid Pango XML (e.g. a bare & in a title string).
                 lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
                 vbox.pack_start(lbl, False, False, 0)
 

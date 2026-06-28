@@ -541,6 +541,62 @@ class CommitRepoTest(unittest.TestCase):
         self.assertIn("claude not found", out)
 
 
+class MarkupSafetyTest(unittest.TestCase):
+    """Regression guard for the silent set_markup failure on unescaped Pango XML.
+
+    RCA (2026-06-28): Settings → Claude Code showed the "Idle worktree" section
+    header but not the "Stuck worktree" one.  Both headers were inserted in the
+    correct DOM order, yet only the stuck one was invisible.  The difference: the
+    stuck title string is "⚠  Stuck worktree — finish & merge prompt", which
+    contains a bare &.  Pango markup is XML; & must be written as &amp;.
+    Gtk.Label.set_markup() does NOT raise on invalid XML — it silently renders
+    an empty label.  The idle title had no & so it rendered correctly.
+
+    Fix: both section() helpers now wrap the title in
+    GLib.markup_escape_text() before embedding it in the <b>…</b> markup
+    string.
+
+    Guardrail: the tests below fail if
+      (a) markup_escape_text is removed from a section() helper, or
+      (b) a new section() title containing & is added without the helper
+          (the ampersand-title presence test proves the check is still live).
+    """
+
+    def _source(self):
+        with open(TRAY_PY, encoding="utf-8") as f:
+            return f.read()
+
+    def test_section_helpers_escape_title(self):
+        """Both section() definitions must use GLib.markup_escape_text(title)."""
+        import re
+        source = self._source()
+        safe = 'set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")'
+        unsafe = re.compile(r'set_markup\(\s*f"<b>\{(?!GLib\.markup_escape_text)')
+        self.assertGreaterEqual(
+            source.count(safe), 2,
+            f"expected ≥2 escaped section() set_markup calls in {TRAY_PY}")
+        bad = unsafe.findall(source)
+        self.assertEqual(
+            bad, [],
+            f"unescaped set_markup interpolation found in {TRAY_PY}: {bad}")
+
+    def test_ampersand_title_still_present(self):
+        """At least one section() call must have & in its title string.
+
+        This keeps the guardrail live: if every & title were renamed, the
+        escape requirement would be impossible to trigger and the above test
+        would no longer prove anything meaningful.
+        """
+        import re
+        source = self._source()
+        titles = re.findall(r'section\("([^"]+)"\)', source)
+        amp = [t for t in titles if "&" in t]
+        self.assertTrue(
+            amp,
+            f"no section() title with & found — guardrail may be stale. "
+            f"Titles seen: {titles}")
+
+
 class PushClaudeArgvTest(unittest.TestCase):
     def test_contains_headless_flags(self):
         argv = tray.push_claude_argv("/x/claude", 10.0)
