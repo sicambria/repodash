@@ -60,6 +60,13 @@ TERMINAL_PREFERENCE = ("ptyxis", "gnome-terminal", "kgx", "ghostty", "xterm")
 _AHEAD_RE = re.compile(r"ahead (\d+)")
 _BEHIND_RE = re.compile(r"behind (\d+)")
 
+
+def _format_age(age_hours: float) -> str:
+    if age_hours < 48:
+        return f"{age_hours:.0f}h"
+    return f"{age_hours / 24:.1f}d"
+
+
 CONFIG_DEFAULTS = {
     "base_dir": "",
     "depth": 0,
@@ -71,6 +78,9 @@ CONFIG_DEFAULTS = {
     "commit_max_workers": 0,    # 0 = auto (RAM/CPU derived); >0 = hard cap
     "commit_timeout": 900,      # seconds per repo (agentic runs are slow)
     "commit_budget_usd": 10.0,  # max $ a single repo's claude run may spend
+    "stale_worktree_idle_hours": 24,
+    "stale_worktree_stuck_hours": 12,
+    "show_stale_worktrees": True,
 }
 
 
@@ -255,9 +265,88 @@ def git_status(repo: str) -> dict:
     }
 
 
-def scan_dirty(base=None, depth=None):
+def _parse_worktree_list(raw: str) -> list:
+    """Parse 'git worktree list --porcelain' into list of {path, branch} dicts.
+
+    The first entry is the main worktree; callers skip index 0.
+    Bare worktrees are excluded.
+    """
+    entries = []
+    current = {}
+    for line in raw.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                entries.append(current)
+            current = {"path": line[9:]}
+        elif line.startswith("branch "):
+            ref = line[7:]
+            prefix = "refs/heads/"
+            current["branch"] = ref[len(prefix):] if ref.startswith(prefix) else ref
+        elif line == "detached":
+            current["branch"] = "(detached)"
+        elif line == "bare":
+            current["_bare"] = True
+    if current:
+        entries.append(current)
+    return [e for e in entries if not e.get("_bare")]
+
+
+def scan_worktrees(repo_path: str, idle_hours: float, stuck_hours: float) -> dict:
+    """Scan extra worktrees of *repo_path* for stuck/idle states.
+
+    Returns {"stuck": [...], "idle": [...]}.
+    Each entry: {path, branch, last_commit_age_hours, behind, dirty}.
+
+    Stuck: dirty == True  AND last_commit_age_hours > stuck_hours
+    Idle:  dirty == False AND ahead == 0 AND last_commit_age_hours > idle_hours
+    """
+    import time
+    result: dict = {"stuck": [], "idle": []}
+    raw = _git(repo_path, "worktree", "list", "--porcelain")
+    if not raw:
+        return result
+    worktrees = _parse_worktree_list(raw)
+    for wt in worktrees[1:]:
+        wt_path = wt["path"]
+        branch = wt.get("branch", "")
+        if not os.path.isdir(wt_path):
+            continue
+        status_out = _git(wt_path, "status", "--porcelain", "-b")
+        if not status_out:
+            continue
+        lines = status_out.splitlines()
+        header = lines[0] if lines and lines[0].startswith("## ") else ""
+        files = [ln for ln in lines[1:] if ln.strip()]
+        dirty = bool(files)
+        ahead = int(_AHEAD_RE.search(header).group(1)) if _AHEAD_RE.search(header) else 0
+        behind = int(_BEHIND_RE.search(header).group(1)) if _BEHIND_RE.search(header) else 0
+        ct = _git(wt_path, "log", "-1", "--format=%ct").strip()
+        if not ct or not ct.isdigit():
+            continue
+        age_hours = (time.time() - int(ct)) / 3600
+        entry = {
+            "path": wt_path,
+            "branch": branch,
+            "last_commit_age_hours": age_hours,
+            "behind": behind,
+            "dirty": dirty,
+        }
+        if dirty and age_hours > stuck_hours:
+            result["stuck"].append(entry)
+        elif not dirty and ahead == 0 and age_hours > idle_hours:
+            result["idle"].append(entry)
+    return result
+
+
+def scan_dirty(base=None, depth=None, cfg=None):
     """All repos' cheap status, sorted by name. Used by the menu and --check."""
-    return [git_status(r) for r in find_repos(base, depth)]
+    repos = [git_status(r) for r in find_repos(base, depth)]
+    if cfg and cfg.get("show_stale_worktrees", True):
+        idle_h = cfg.get("stale_worktree_idle_hours", 24)
+        stuck_h = cfg.get("stale_worktree_stuck_hours", 12)
+        for r in repos:
+            r["stale_worktrees"] = scan_worktrees(r["path"], idle_h, stuck_h)
+    return repos
 
 
 # ── GitHub URL resolution ────────────────────────────────────────────────────
@@ -641,7 +730,7 @@ def run_check() -> int:
           f"${cfg.get('commit_budget_usd', 10.0)}/repo  [{avail_desc}]")
     print(f"  claude   : {claude_bin}")
 
-    repos = scan_dirty(base, depth)
+    repos = scan_dirty(base, depth, cfg)
     repos = [r for r in repos if r["path"] not in excluded]
     if not show_remoteless:
         repos = [r for r in repos if r["has_remote"]]
@@ -662,6 +751,21 @@ def run_check() -> int:
             gh = github_url(r["path"])
             print(f"  • {r['name']}  [{r['branch']} +{r['unpushed']}]"
                   + (f"  {gh}" if gh else ""))
+    stuck_all = [(r, w) for r in repos
+                 for w in r.get("stale_worktrees", {}).get("stuck", [])]
+    idle_all = [(r, w) for r in repos
+                for w in r.get("stale_worktrees", {}).get("idle", [])]
+    if stuck_all:
+        print("\nstuck wt  :")
+        for r, w in stuck_all:
+            print(f"  ⚠ {r['name']}  [{w['branch']}]  "
+                  f"{_format_age(w['last_commit_age_hours'])} ago  dirty")
+    if idle_all:
+        print("\nidle wt   :")
+        for r, w in idle_all:
+            behind_s = f"  ↓{w['behind']}" if w["behind"] else ""
+            print(f"  ⏸ {r['name']}  [{w['branch']}]  "
+                  f"{_format_age(w['last_commit_age_hours'])} ago{behind_s}")
     return 0
 
 
@@ -771,7 +875,7 @@ def run_gui() -> int:
                 base = resolve_base_dir(cfg)
                 depth = resolve_depth(cfg)
                 excluded = set(cfg.get("excluded_repos", []))
-                repos = scan_dirty(base, depth)
+                repos = scan_dirty(base, depth, cfg)
                 repos = [r for r in repos if r["path"] not in excluded]
                 if not cfg.get("show_remoteless", True):
                     repos = [r for r in repos if r["has_remote"]]
@@ -824,6 +928,27 @@ def run_gui() -> int:
                     menu.append(self._repo_item(r, unpushed=True))
                 self._action(menu, f"Push all ({len(unpushed)})…",
                              lambda *_: self._on_push_all())
+
+            stuck_repos = [r for r in self.repos
+                           if r.get("stale_worktrees", {}).get("stuck")]
+            idle_repos = [r for r in self.repos
+                          if r.get("stale_worktrees", {}).get("idle")]
+
+            if stuck_repos:
+                menu.append(Gtk.SeparatorMenuItem())
+                hdr = Gtk.MenuItem(label="⚠ Stuck worktrees")
+                hdr.set_sensitive(False)
+                menu.append(hdr)
+                for r in stuck_repos:
+                    menu.append(self._stale_repo_item(r, "stuck"))
+
+            if idle_repos:
+                menu.append(Gtk.SeparatorMenuItem())
+                hdr = Gtk.MenuItem(label="⏸ Idle worktrees")
+                hdr.set_sensitive(False)
+                menu.append(hdr)
+                for r in idle_repos:
+                    menu.append(self._stale_repo_item(r, "idle"))
 
             menu.append(Gtk.SeparatorMenuItem())
             self._action(menu, "Show dashboard…",
@@ -944,6 +1069,43 @@ def run_gui() -> int:
             self._action(sub, "Open folder",
                          lambda *_: notify(self.window, *open_folder(path)))
             self._action(sub, "Copy path", lambda *_: self._copy(path))
+            item.set_submenu(sub)
+            return item
+
+        def _worktree_item(self, wt, severity):
+            age_str = _format_age(wt["last_commit_age_hours"])
+            if severity == "stuck":
+                label = f"  {wt['branch']}  {age_str} ago (dirty)"
+            else:
+                behind_s = f"  ↓{wt['behind']}" if wt["behind"] else ""
+                label = f"  {wt['branch']}  {age_str} ago{behind_s}"
+            item = Gtk.MenuItem(label=label)
+            sub = Gtk.Menu()
+            path = wt["path"]
+            self._action(sub, "Open terminal",
+                         lambda *_, p=path: notify(self.window, *open_terminal(p)))
+            self._action(sub, "Open Claude Code",
+                         lambda *_, p=path: notify(self.window, *open_claude(p)))
+            self._action(sub, "Open folder",
+                         lambda *_, p=path: notify(self.window, *open_folder(p)))
+            self._action(sub, "Copy path", lambda *_, p=path: self._copy(p))
+            item.set_submenu(sub)
+            return item
+
+        def _stale_repo_item(self, r, severity):
+            wt_list = r["stale_worktrees"][severity]
+            oldest = max(wt_list, key=lambda w: w["last_commit_age_hours"])
+            n = len(wt_list)
+            age_str = _format_age(oldest["last_commit_age_hours"])
+            if severity == "stuck":
+                label = f"⚠ {r['name']}  ({n} stuck, oldest {age_str})"
+            else:
+                behind_s = f", {oldest['behind']} behind" if oldest["behind"] else ""
+                label = f"⏸ {r['name']}  ({n} idle, oldest {age_str}{behind_s})"
+            item = Gtk.MenuItem(label=label)
+            sub = Gtk.Menu()
+            for wt in wt_list:
+                sub.append(self._worktree_item(wt, severity))
             item.set_submenu(sub)
             return item
 
@@ -1503,6 +1665,26 @@ def run_gui() -> int:
             row(15, "Commit budget ($/repo)", self._spin_commit_budget,
                 "max claude spend per repo (0 = unbounded)")
 
+            self._chk_show_stale = Gtk.CheckButton(
+                label="Detect stale worktrees")
+            self._chk_show_stale.set_active(
+                self._config.get("show_stale_worktrees", True))
+            grid.attach(self._chk_show_stale, 1, 17, 1, 1)
+
+            adj_idle = Gtk.Adjustment(
+                value=self._config.get("stale_worktree_idle_hours", 24),
+                lower=1, upper=8760, step_increment=1)
+            self._spin_idle_hours = Gtk.SpinButton(adjustment=adj_idle, digits=0)
+            row(18, "Idle threshold (h)", self._spin_idle_hours,
+                "clean+no-ahead worktree older than this is idle (⏸)")
+
+            adj_stuck = Gtk.Adjustment(
+                value=self._config.get("stale_worktree_stuck_hours", 12),
+                lower=1, upper=8760, step_increment=1)
+            self._spin_stuck_hours = Gtk.SpinButton(adjustment=adj_stuck, digits=0)
+            row(20, "Stuck threshold (h)", self._spin_stuck_hours,
+                "dirty worktree older than this is stuck (⚠)")
+
             return grid
 
         def _build_repos_tab(self):
@@ -1573,6 +1755,9 @@ def run_gui() -> int:
             cfg["commit_timeout"] = int(self._spin_commit_timeout.get_value())
             cfg["commit_budget_usd"] = round(
                 self._spin_commit_budget.get_value(), 2)
+            cfg["show_stale_worktrees"] = self._chk_show_stale.get_active()
+            cfg["stale_worktree_idle_hours"] = int(self._spin_idle_hours.get_value())
+            cfg["stale_worktree_stuck_hours"] = int(self._spin_stuck_hours.get_value())
             # Repos unchecked in the current scan list.
             shown_excluded = {
                 path for path, chk in self._repo_checks.items()

@@ -541,5 +541,132 @@ class CommitRepoTest(unittest.TestCase):
         self.assertIn("claude not found", out)
 
 
+class StaleWorktreeTest(unittest.TestCase):
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_no_extra_worktrees_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            result = tray.scan_worktrees(repo, idle_hours=24, stuck_hours=12)
+            self.assertEqual(result, {"stuck": [], "idle": []})
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_idle_worktree_detected_at_zero_threshold(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=9999)
+            branches = [e["branch"] for e in result["idle"]]
+            self.assertIn("feat", branches)
+            self.assertEqual(result["stuck"], [])
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_stuck_worktree_detected_at_zero_threshold(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            with open(os.path.join(wt, "new.txt"), "w") as f:
+                f.write("change")
+            result = tray.scan_worktrees(repo, idle_hours=9999, stuck_hours=0)
+            branches = [e["branch"] for e in result["stuck"]]
+            self.assertIn("feat", branches)
+            self.assertEqual(result["idle"], [])
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_dirty_worktree_is_never_idle(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            with open(os.path.join(wt, "new.txt"), "w") as f:
+                f.write("change")
+            result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=0)
+            self.assertEqual(result["idle"], [])
+            self.assertEqual(len(result["stuck"]), 1)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_worktree_entry_has_required_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=9999)
+            self.assertEqual(len(result["idle"]), 1)
+            e = result["idle"][0]
+            for field in ("path", "branch", "last_commit_age_hours", "behind", "dirty"):
+                self.assertIn(field, e)
+            self.assertEqual(e["branch"], "feat")
+            self.assertFalse(e["dirty"])
+            self.assertIsInstance(e["last_commit_age_hours"], float)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_high_threshold_suppresses_detection(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            result = tray.scan_worktrees(repo, idle_hours=9999, stuck_hours=9999)
+            self.assertEqual(result, {"stuck": [], "idle": []})
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_scan_dirty_attaches_stale_worktrees_with_cfg(self):
+        with tempfile.TemporaryDirectory() as base:
+            repo = os.path.join(base, "myrepo")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(base, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            cfg = {"show_stale_worktrees": True,
+                   "stale_worktree_idle_hours": 0,
+                   "stale_worktree_stuck_hours": 9999}
+            repos = tray.scan_dirty(base, depth=2, cfg=cfg)
+            found = {r["name"]: r for r in repos}
+            self.assertIn("myrepo", found)
+            self.assertNotIn("wt", found)
+            sw = found["myrepo"].get("stale_worktrees", {})
+            self.assertIn("feat", [e["branch"] for e in sw.get("idle", [])])
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_scan_dirty_no_stale_when_disabled(self):
+        with tempfile.TemporaryDirectory() as base:
+            repo = os.path.join(base, "r")
+            _init_repo(repo)
+            _commit(repo)
+            cfg = {"show_stale_worktrees": False,
+                   "stale_worktree_idle_hours": 0,
+                   "stale_worktree_stuck_hours": 0}
+            repos = tray.scan_dirty(base, depth=2, cfg=cfg)
+            for r in repos:
+                self.assertNotIn("stale_worktrees", r)
+
+    def test_format_age_hours(self):
+        self.assertEqual(tray._format_age(3), "3h")
+        self.assertEqual(tray._format_age(47), "47h")
+
+    def test_format_age_days(self):
+        self.assertEqual(tray._format_age(48), "2.0d")
+        self.assertEqual(tray._format_age(72), "3.0d")
+
+
 if __name__ == "__main__":
     unittest.main()
