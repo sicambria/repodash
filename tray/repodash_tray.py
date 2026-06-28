@@ -32,6 +32,7 @@ import sys
 # ── configuration ────────────────────────────────────────────────────────────
 DEFAULT_DEPTH = 3
 DEFAULT_INTERVAL = 90  # seconds between cheap menu refreshes
+VERSION = "1.0"
 CLAUDE_COMMAND = "claude --dangerously-skip-permissions"
 # Headless "Commit all": the claude binary (resolved via shutil.which) and the
 # instruction it runs non-interactively per repo. The run is bounded by a dollar
@@ -1053,6 +1054,7 @@ def run_gui() -> int:
             self._action(menu, "Refresh now", lambda *_: self.refresh_menu())
             self._action(menu, "Settings…", lambda *_: self._on_settings())
             self._action(menu, "Help…", lambda *_: self._on_help())
+            self._action(menu, "About…", lambda *_: self._on_about())
 
             start_item = Gtk.CheckMenuItem(label="Start on login")
             start_item.set_active(autostart_enabled())  # set before connecting
@@ -1196,6 +1198,32 @@ def run_gui() -> int:
         def _on_help(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
             dlg = HelpDialog(parent)
+            dlg.run()
+            dlg.destroy()
+
+        def _on_about(self):
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = Gtk.AboutDialog(transient_for=parent, modal=True)
+            dlg.set_program_name("repodash")
+            dlg.set_version(VERSION)
+            dlg.set_comments(
+                "A tray companion for your git repositories.\n"
+                "Monitors dirty repos, unpushed commits, and stale\n"
+                "worktrees — and launches Claude Code actions from\n"
+                "the menu."
+            )
+            dlg.set_copyright("© 2026 repodash contributors")
+            dlg.set_license_type(Gtk.License.GPL_3_0)
+            dlg.set_authors(["repodash contributors"])
+            dlg.set_website("https://github.com/sicambria/repodash")
+            dlg.set_website_label("github.com/sicambria/repodash")
+            if os.path.isfile(ICON_SVG):
+                try:
+                    from gi.repository import GdkPixbuf
+                    pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_SVG, 64, 64)
+                    dlg.set_logo(pb)
+                except Exception:
+                    pass
             dlg.run()
             dlg.destroy()
 
