@@ -44,4 +44,4 @@ tests/
 
 ## Git workflow
 
-Always commit to local `main` (never to a feature branch).
+Always commit to local `main` (never to a feature branch). Commit after every change — never leave `main` with uncommitted modifications.
