@@ -113,7 +113,7 @@ CONFIG_DEFAULTS = {
     "show_remoteless": True,
     "commit_ram_mb": 2048,      # RAM budget per claude process (MB)
     "commit_max_workers": 0,    # 0 = auto (RAM/CPU derived); >0 = hard cap
-    "commit_timeout": 900,      # seconds per repo (agentic runs are slow)
+    "commit_timeout": 3600,     # seconds per repo (agentic runs are slow)
     "commit_budget_usd": 10.0,  # max $ a single repo's claude run may spend
     "stale_worktree_idle_hours": 24,
     "stale_worktree_stuck_hours": 12,
@@ -899,7 +899,7 @@ def run_check() -> int:
     avail_desc = f"{avail} MB avail" if avail else "RAM unknown"
     claude_bin = shutil.which(CLAUDE_BIN) or "(not on PATH)"
     print(f"commit    : {ram_mb} MB/proc, {cap_desc} → {workers} workers, "
-          f"{cfg.get('commit_timeout', 900)}s timeout, "
+          f"{cfg.get('commit_timeout', 3600)}s timeout, "
           f"${cfg.get('commit_budget_usd', 10.0)}/repo  [{avail_desc}]")
     print(f"  claude   : {claude_bin}")
 
@@ -1006,6 +1006,7 @@ def run_gui() -> int:
             self.repos = []          # cheap status list (menu tier)
             self.model = None        # full model (dashboard tier), lazy
             self._timer_id = 0
+            self._op_running = False  # True while a commit/push dialog is open
             self.config = load_config()
             apply_config_to_env(self.config)
 
@@ -1189,7 +1190,21 @@ def run_gui() -> int:
                         self.window.reload()
             dlg.destroy()
 
+        def _run_op_dialog(self, dlg):
+            """Run a commit/push dialog, blocking concurrent ops."""
+            if self._op_running:
+                return
+            self._op_running = True
+            try:
+                dlg.run()
+            finally:
+                self._op_running = False
+                dlg.destroy()
+                self.refresh_menu()
+
         def _on_push_all(self):
+            if self._op_running:
+                return
             # Recompute from the latest scan (the menu may have refreshed since
             # it was built) so we never push a stale set.
             repos = [r for r in self.repos
@@ -1197,12 +1212,11 @@ def run_gui() -> int:
             if not repos:
                 return
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = PushAllDialog(parent, repos)
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()  # reflect the now-pushed repos
+            self._run_op_dialog(PushAllDialog(parent, repos))
 
         def _on_commit_all(self):
+            if self._op_running:
+                return
             # Recompute the dirty set from the latest scan so a refresh between
             # menu-build and click never commits a stale list.
             repos = [r for r in self.repos if r["dirty"]]
@@ -1210,67 +1224,63 @@ def run_gui() -> int:
                 return
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = CommitAllDialog(parent, repos,
-                                  cfg.get("commit_ram_mb", 2048),
-                                  cfg.get("commit_max_workers", 0),
-                                  cfg.get("commit_timeout", 900),
-                                  cfg.get("commit_budget_usd", 10.0))
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()  # reflect now-clean / merged repos
+            self._run_op_dialog(CommitAllDialog(parent, repos,
+                                                cfg.get("commit_ram_mb", 2048),
+                                                cfg.get("commit_max_workers", 0),
+                                                cfg.get("commit_timeout", 3600),
+                                                cfg.get("commit_budget_usd", 10.0)))
 
         def _on_commit_repo(self, r):
+            if self._op_running:
+                return
             # Single-repo counterpart to _on_commit_all: same headless-Claude
             # flow (logical chunks, repo-conventional messages, docs, merge),
             # just scoped to one repo via the shared progress dialog.
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = CommitAllDialog(parent, [r],
-                                  cfg.get("commit_ram_mb", 2048),
-                                  cfg.get("commit_max_workers", 0),
-                                  cfg.get("commit_timeout", 900),
-                                  cfg.get("commit_budget_usd", 10.0))
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()  # reflect now-clean / merged repo
+            self._run_op_dialog(CommitAllDialog(parent, [r],
+                                                cfg.get("commit_ram_mb", 2048),
+                                                cfg.get("commit_max_workers", 0),
+                                                cfg.get("commit_timeout", 3600),
+                                                cfg.get("commit_budget_usd", 10.0)))
 
         def _on_push_claude_repo(self, r):
+            if self._op_running:
+                return
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = CommitAllDialog(
+            self._run_op_dialog(CommitAllDialog(
                 parent, [r],
                 cfg.get("commit_ram_mb", 2048),
                 cfg.get("commit_max_workers", 0),
-                cfg.get("commit_timeout", 900),
+                cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
-                argv_fn=push_claude_stream_argv)
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()
+                argv_fn=push_claude_stream_argv))
 
         def _on_push_claude_all(self):
+            if self._op_running:
+                return
             repos = [r for r in self.repos
                      if r["has_remote"] and r["unpushed"] > 0]
             if not repos:
                 return
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = CommitAllDialog(
+            self._run_op_dialog(CommitAllDialog(
                 parent, repos,
                 cfg.get("commit_ram_mb", 2048),
                 cfg.get("commit_max_workers", 0),
-                cfg.get("commit_timeout", 900),
+                cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
-                argv_fn=push_claude_stream_argv)
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()
+                argv_fn=push_claude_stream_argv))
 
         def _on_wt_push_claude(self, wt, repo):
+            if self._op_running:
+                return
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
             r = {
@@ -1279,18 +1289,15 @@ def run_gui() -> int:
                 "branch": wt.get("branch", ""),
                 "unpushed": 0,
             }
-            dlg = CommitAllDialog(
+            self._run_op_dialog(CommitAllDialog(
                 parent, [r],
                 cfg.get("commit_ram_mb", 2048),
                 cfg.get("commit_max_workers", 0),
-                cfg.get("commit_timeout", 900),
+                cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: rr.get("branch", ""),
-                argv_fn=push_claude_stream_argv)
-            dlg.run()
-            dlg.destroy()
-            self.refresh_menu()
+                argv_fn=push_claude_stream_argv))
 
         def _on_help(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
@@ -2376,7 +2383,7 @@ def run_gui() -> int:
                 "Max workers:", "commit_max_workers", 0, 0, 64, 1,
                 hint="0 = auto (RAM- and CPU-derived); >0 caps concurrency")
             self._spin_commit_timeout = spin_row(
-                "Timeout (s):", "commit_timeout", 900, 30, 7200, 30,
+                "Timeout (s):", "commit_timeout", 3600, 30, 7200, 30,
                 hint="per-repo cap before a claude run is killed")
             self._spin_commit_budget = spin_row(
                 "Budget ($/repo):", "commit_budget_usd", 10.0, 0, 1000, 1,
