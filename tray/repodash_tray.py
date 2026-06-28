@@ -915,6 +915,7 @@ def run_gui() -> int:
         # -- menu tier --
         def refresh_menu(self):
             cfg = self.config
+            self.indicator.set_label("↻", "")
 
             def work():
                 base = resolve_base_dir(cfg)
@@ -1678,6 +1679,8 @@ def run_gui() -> int:
             notebook = Gtk.Notebook()
             notebook.append_page(self._build_general_tab(),
                                  Gtk.Label(label="General"))
+            notebook.append_page(self._build_git_tab(),
+                                 Gtk.Label(label="Git"))
             notebook.append_page(self._build_repos_tab(),
                                  Gtk.Label(label="Repositories"))
             notebook.append_page(self._build_claude_tab(),
@@ -1726,44 +1729,6 @@ def run_gui() -> int:
                 "default: auto-detect (ptyxis, gnome-terminal, …)")
             self._entry_terminal.set_text(self._config.get("terminal", ""))
             row(6, "Terminal", self._entry_terminal)
-
-            self._chk_remoteless = Gtk.CheckButton(
-                label="Show repos without a remote")
-            self._chk_remoteless.set_active(
-                self._config.get("show_remoteless", True))
-            grid.attach(self._chk_remoteless, 1, 8, 1, 1)
-
-            # "Commit all" tuning: how hard the headless batch may push the host.
-            adj_ram = Gtk.Adjustment(
-                value=self._config.get("commit_ram_mb", 2048),
-                lower=256, upper=65536, step_increment=256)
-            self._spin_commit_ram = Gtk.SpinButton(adjustment=adj_ram, digits=0)
-            row(9, "Commit RAM/proc (MB)", self._spin_commit_ram,
-                "RAM budgeted per claude process; workers = MemAvailable ÷ this")
-
-            adj_workers = Gtk.Adjustment(
-                value=self._config.get("commit_max_workers", 0),
-                lower=0, upper=64, step_increment=1)
-            self._spin_commit_workers = Gtk.SpinButton(
-                adjustment=adj_workers, digits=0)
-            row(11, "Commit max workers", self._spin_commit_workers,
-                "0 = auto (RAM- and CPU-derived); >0 caps concurrency")
-
-            adj_timeout = Gtk.Adjustment(
-                value=self._config.get("commit_timeout", 900),
-                lower=30, upper=7200, step_increment=30)
-            self._spin_commit_timeout = Gtk.SpinButton(
-                adjustment=adj_timeout, digits=0)
-            row(13, "Commit timeout (s)", self._spin_commit_timeout,
-                "per-repo cap before a claude run is killed")
-
-            adj_budget = Gtk.Adjustment(
-                value=self._config.get("commit_budget_usd", 10.0),
-                lower=0, upper=1000, step_increment=1)
-            self._spin_commit_budget = Gtk.SpinButton(
-                adjustment=adj_budget, digits=2)
-            row(15, "Commit budget ($/repo)", self._spin_commit_budget,
-                "max claude spend per repo (0 = unbounded)")
 
             return grid
 
@@ -1823,7 +1788,7 @@ def run_gui() -> int:
         def _on_rescan(self, *_):
             self._populate_repo_list()
 
-        def _build_claude_tab(self):
+        def _build_git_tab(self):
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             vbox.set_border_width(12)
 
@@ -1847,6 +1812,60 @@ def run_gui() -> int:
                 vbox.pack_start(hbox, False, False, 0)
                 return spin
 
+            section("Repositories")
+            self._chk_remoteless = Gtk.CheckButton(
+                label="Show repos without a remote")
+            self._chk_remoteless.set_active(
+                self._config.get("show_remoteless", True))
+            vbox.pack_start(self._chk_remoteless, False, False, 0)
+
+            section("Stale worktree detection")
+            self._chk_show_stale = Gtk.CheckButton(
+                label="Enable stale worktree detection")
+            self._chk_show_stale.set_active(
+                self._config.get("show_stale_worktrees", True))
+            vbox.pack_start(self._chk_show_stale, False, False, 0)
+
+            section("⏸  Idle worktree")
+            self._spin_idle_hours = spin_row(
+                "Idle threshold (h):", "stale_worktree_idle_hours", 24, 1, 8760, 1,
+                "clean+no-ahead worktrees older than this are idle")
+
+            section("⚠  Stuck worktree")
+            self._spin_stuck_hours = spin_row(
+                "Stuck threshold (h):", "stale_worktree_stuck_hours", 12, 1, 8760, 1,
+                "dirty worktrees older than this are stuck")
+
+            outer = Gtk.ScrolledWindow()
+            outer.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            outer.add(vbox)
+            return outer
+
+        def _build_claude_tab(self):
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            vbox.set_border_width(12)
+
+            def section(title):
+                lbl = Gtk.Label(xalign=0.0)
+                lbl.set_markup(f"<b>{title}</b>")
+                vbox.pack_start(lbl, False, False, 0)
+
+            def spin_row(label_text, key, default, lo, hi, step,
+                        digits=0, hint=None):
+                hbox = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
+                hbox.pack_start(lbl, False, False, 0)
+                adj = Gtk.Adjustment(value=self._config.get(key, default),
+                                     lower=lo, upper=hi, step_increment=step)
+                spin = Gtk.SpinButton(adjustment=adj, digits=digits)
+                hbox.pack_start(spin, False, False, 0)
+                if hint:
+                    hl = Gtk.Label(label=hint, xalign=0.0)
+                    hl.get_style_context().add_class("dim-label")
+                    hbox.pack_start(hl, False, False, 0)
+                vbox.pack_start(hbox, False, False, 0)
+                return spin
+
             def prompt_row(label_text, key, default_text):
                 lbl = Gtk.Label(label=label_text, xalign=0.0)
                 vbox.pack_start(lbl, False, False, 0)
@@ -1862,19 +1881,20 @@ def run_gui() -> int:
                 vbox.pack_start(sw, True, True, 0)
                 return buf
 
-            # ── Detection ──────────────────────────────────────────────────
-            section("Stale worktree detection")
-            self._chk_show_stale = Gtk.CheckButton(label="Enable stale worktree detection")
-            self._chk_show_stale.set_active(
-                self._config.get("show_stale_worktrees", True))
-            vbox.pack_start(self._chk_show_stale, False, False, 0)
-
-            self._spin_idle_hours = spin_row(
-                "Idle threshold (h):", "stale_worktree_idle_hours", 24, 1, 8760, 1,
-                "clean+no-ahead worktrees older than this are idle (⏸)")
-            self._spin_stuck_hours = spin_row(
-                "Stuck threshold (h):", "stale_worktree_stuck_hours", 12, 1, 8760, 1,
-                "dirty worktrees older than this are stuck (⚠)")
+            # ── Commit ─────────────────────────────────────────────────────
+            section("Commit via Claude Code")
+            self._spin_commit_ram = spin_row(
+                "RAM/proc (MB):", "commit_ram_mb", 2048, 256, 65536, 256,
+                hint="RAM budgeted per claude process; workers = MemAvailable ÷ this")
+            self._spin_commit_workers = spin_row(
+                "Max workers:", "commit_max_workers", 0, 0, 64, 1,
+                hint="0 = auto (RAM- and CPU-derived); >0 caps concurrency")
+            self._spin_commit_timeout = spin_row(
+                "Timeout (s):", "commit_timeout", 900, 30, 7200, 30,
+                hint="per-repo cap before a claude run is killed")
+            self._spin_commit_budget = spin_row(
+                "Budget ($/repo):", "commit_budget_usd", 10.0, 0, 1000, 1,
+                digits=2, hint="max claude spend per repo (0 = unbounded)")
 
             # ── Prompts ────────────────────────────────────────────────────
             section("⏸  Idle worktree — close prompt")
