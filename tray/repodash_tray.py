@@ -331,20 +331,24 @@ def _parse_worktree_list(raw: str) -> list:
 
 
 def scan_worktrees(repo_path: str, idle_hours: float, stuck_hours: float) -> dict:
-    """Scan extra worktrees of *repo_path* for stuck/idle states.
+    """Scan extra worktrees of *repo_path* for stuck/idle/merged states.
 
-    Returns {"stuck": [...], "idle": [...]}.
+    Returns {"stuck": [...], "idle": [...], "merged": [...]}.
     Each entry: {path, branch, last_commit_age_hours, behind, dirty}.
 
-    Stuck: dirty == True  AND last_commit_age_hours > stuck_hours
-    Idle:  dirty == False AND ahead == 0 AND last_commit_age_hours > idle_hours
+    Stuck:  dirty == True  AND last_commit_age_hours > stuck_hours
+    Merged: dirty == False AND ahead == 0 AND age > idle_hours
+            AND rev-list HEAD --not <parent> == 0  (no unique commits)
+    Idle:   dirty == False AND ahead == 0 AND age > idle_hours
+            AND rev-list HEAD --not <parent> > 0  (unique commits not yet in parent)
     """
     import time
-    result: dict = {"stuck": [], "idle": []}
+    result: dict = {"stuck": [], "idle": [], "merged": []}
     raw = _git(repo_path, "worktree", "list", "--porcelain")
     if not raw:
         return result
     worktrees = _parse_worktree_list(raw)
+    parent_branch = _git(repo_path, "branch", "--show-current").strip() or "main"
     for wt in worktrees[1:]:
         wt_path = wt["path"]
         branch = wt.get("branch", "")
@@ -373,7 +377,12 @@ def scan_worktrees(repo_path: str, idle_hours: float, stuck_hours: float) -> dic
         if dirty and age_hours > stuck_hours:
             result["stuck"].append(entry)
         elif not dirty and ahead == 0 and age_hours > idle_hours:
-            result["idle"].append(entry)
+            unmerged = _git(wt_path, "rev-list", "--count",
+                            "HEAD", "--not", parent_branch).strip()
+            if unmerged == "0":
+                result["merged"].append(entry)
+            else:
+                result["idle"].append(entry)
     return result
 
 
@@ -540,13 +549,20 @@ def open_wt_claude(wt_path: str, prompt_text: str):
     return open_terminal(wt_path, cmd)
 
 
-def remove_worktree(repo_path: str, wt_path: str):
-    """Remove a git worktree directly (no Claude). Returns (ok, message)."""
+def remove_worktree(repo_path: str, wt_path: str, branch: str = "") -> tuple:
+    """Remove a git worktree and optionally delete its branch. Returns (ok, message)."""
     try:
         out = subprocess.run(
             ["git", "-C", repo_path, "worktree", "remove", wt_path],
             capture_output=True, text=True, timeout=15)
-        return out.returncode == 0, (out.stdout + out.stderr).strip()
+        if out.returncode != 0:
+            return False, (out.stdout + out.stderr).strip()
+        if branch:
+            bout = subprocess.run(
+                ["git", "-C", repo_path, "branch", "-d", branch],
+                capture_output=True, text=True, timeout=15)
+            return True, (bout.stdout + bout.stderr).strip() or f"Removed {branch}"
+        return True, (out.stdout + out.stderr).strip()
     except (OSError, subprocess.SubprocessError) as e:
         return False, str(e)
 
@@ -859,6 +875,13 @@ def run_check() -> int:
             behind_s = f"  ↓{w['behind']}" if w["behind"] else ""
             print(f"  ⏸ {r['name']}  [{w['branch']}]  "
                   f"{_format_age(w['last_commit_age_hours'])} ago{behind_s}")
+    merged_all = [(r, w) for r in repos
+                  for w in r.get("stale_worktrees", {}).get("merged", [])]
+    if merged_all:
+        print("\nmerged wt :")
+        for r, w in merged_all:
+            print(f"  ✓ {r['name']}  [{w['branch']}]  "
+                  f"{_format_age(w['last_commit_age_hours'])} ago  (absorbed in main — safe to remove)")
     return 0
 
 
@@ -979,7 +1002,7 @@ def run_gui() -> int:
                 for r in repos:
                     sw = r.get("stale_worktrees") or {}
                     if (r["dirty"] or (r["has_remote"] and r["unpushed"])
-                            or sw.get("stuck") or sw.get("idle")):
+                            or sw.get("stuck") or sw.get("idle") or sw.get("merged")):
                         r["github"] = github_url(r["path"])
                 GLib.idle_add(self._apply_repos, repos)
             threading.Thread(target=work, daemon=True).start()
@@ -1031,6 +1054,8 @@ def run_gui() -> int:
                            if r.get("stale_worktrees", {}).get("stuck")]
             idle_repos = [r for r in self.repos
                           if r.get("stale_worktrees", {}).get("idle")]
+            merged_repos = [r for r in self.repos
+                            if r.get("stale_worktrees", {}).get("merged")]
 
             if stuck_repos:
                 menu.append(Gtk.SeparatorMenuItem())
@@ -1047,6 +1072,14 @@ def run_gui() -> int:
                 menu.append(hdr)
                 for r in idle_repos:
                     menu.append(self._stale_repo_item(r, "idle"))
+
+            if merged_repos:
+                menu.append(Gtk.SeparatorMenuItem())
+                hdr = Gtk.MenuItem(label="✓ Merged worktrees")
+                hdr.set_sensitive(False)
+                menu.append(hdr)
+                for r in merged_repos:
+                    menu.append(self._stale_repo_item(r, "merged"))
 
             menu.append(Gtk.SeparatorMenuItem())
             self._action(menu, "Show dashboard…",
@@ -1269,6 +1302,8 @@ def run_gui() -> int:
             age_str = _format_age(wt["last_commit_age_hours"])
             if severity == "stuck":
                 label = f"  {wt['branch']}  {age_str} ago (dirty)"
+            elif severity == "merged":
+                label = f"  {wt['branch']}  {age_str} ago (absorbed in main)"
             else:
                 behind_s = f"  ↓{wt['behind']}" if wt["behind"] else ""
                 label = f"  {wt['branch']}  {age_str} ago{behind_s}"
@@ -1300,6 +1335,12 @@ def run_gui() -> int:
                 sub.append(Gtk.SeparatorMenuItem())
                 self._action(sub, "Finish & merge via Claude Code…",
                              lambda *_, w=wt, rr=r: self._on_wt_finish(w, rr))
+            elif severity == "merged":
+                sub.append(Gtk.SeparatorMenuItem())
+                self._action(sub, "Clean up (remove worktree + delete branch)",
+                             lambda *_, w=wt, rp=repo_path: self._on_wt_cleanup(w, rp))
+                self._action(sub, "Remove worktree only",
+                             lambda *_, w=wt, rp=repo_path: self._on_wt_remove(w, rp))
             else:
                 sub.append(Gtk.SeparatorMenuItem())
                 self._action(sub, "Close via Claude Code…",
@@ -1338,6 +1379,12 @@ def run_gui() -> int:
             if ok:
                 self.refresh_menu()
 
+        def _on_wt_cleanup(self, wt, repo_path):
+            ok, msg = remove_worktree(repo_path, wt["path"], branch=wt["branch"])
+            notify(self.window, ok, msg or f"Cleaned up {wt['branch']}")
+            if ok:
+                self.refresh_menu()
+
         def _stale_repo_item(self, r, severity):
             wt_list = r["stale_worktrees"][severity]
             oldest = max(wt_list, key=lambda w: w["last_commit_age_hours"])
@@ -1345,6 +1392,8 @@ def run_gui() -> int:
             age_str = _format_age(oldest["last_commit_age_hours"])
             if severity == "stuck":
                 label = f"⚠ {r['name']}  ({n} stuck, oldest {age_str})"
+            elif severity == "merged":
+                label = f"✓ {r['name']}  ({n} merged, oldest {age_str})"
             else:
                 behind_s = f", {oldest['behind']} behind" if oldest["behind"] else ""
                 label = f"⏸ {r['name']}  ({n} idle, oldest {age_str}{behind_s})"

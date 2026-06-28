@@ -640,7 +640,7 @@ class StaleWorktreeTest(unittest.TestCase):
             _init_repo(repo)
             _commit(repo)
             result = tray.scan_worktrees(repo, idle_hours=24, stuck_hours=12)
-            self.assertEqual(result, {"stuck": [], "idle": []})
+            self.assertEqual(result, {"stuck": [], "idle": [], "merged": []})
 
     @unittest.skipUnless(HAVE_GIT, "git not available")
     def test_idle_worktree_detected_at_zero_threshold(self):
@@ -651,10 +651,12 @@ class StaleWorktreeTest(unittest.TestCase):
             wt = os.path.join(d, "wt")
             subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
                            check=True)
+            _commit(wt, fname="wt.txt")  # unique commit keeps it in "idle", not "merged"
             result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=9999)
             branches = [e["branch"] for e in result["idle"]]
             self.assertIn("feat", branches)
             self.assertEqual(result["stuck"], [])
+            self.assertEqual(result["merged"], [])
 
     @unittest.skipUnless(HAVE_GIT, "git not available")
     def test_stuck_worktree_detected_at_zero_threshold(self):
@@ -696,6 +698,7 @@ class StaleWorktreeTest(unittest.TestCase):
             wt = os.path.join(d, "wt")
             subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
                            check=True)
+            _commit(wt, fname="wt.txt")  # unique commit keeps it in "idle", not "merged"
             result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=9999)
             self.assertEqual(len(result["idle"]), 1)
             e = result["idle"][0]
@@ -715,7 +718,7 @@ class StaleWorktreeTest(unittest.TestCase):
             subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
                            check=True)
             result = tray.scan_worktrees(repo, idle_hours=9999, stuck_hours=9999)
-            self.assertEqual(result, {"stuck": [], "idle": []})
+            self.assertEqual(result, {"stuck": [], "idle": [], "merged": []})
 
     @unittest.skipUnless(HAVE_GIT, "git not available")
     def test_scan_dirty_attaches_stale_worktrees_with_cfg(self):
@@ -726,6 +729,7 @@ class StaleWorktreeTest(unittest.TestCase):
             wt = os.path.join(base, "wt")
             subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
                            check=True)
+            _commit(wt, fname="wt.txt")  # unique commit keeps it in "idle", not "merged"
             cfg = {"show_stale_worktrees": True,
                    "stale_worktree_idle_hours": 0,
                    "stale_worktree_stuck_hours": 9999}
@@ -735,6 +739,25 @@ class StaleWorktreeTest(unittest.TestCase):
             self.assertNotIn("wt", found)
             sw = found["myrepo"].get("stale_worktrees", {})
             self.assertIn("feat", [e["branch"] for e in sw.get("idle", [])])
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_merged_worktree_detected_after_ff_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(d, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-b", "feat", wt],
+                           check=True)
+            _commit(wt, fname="wt.txt")
+            # Fast-forward merge feat into main so the branch has no unique commits left
+            subprocess.run(["git", "-C", repo, "merge", "--ff-only", "feat"],
+                           check=True)
+            result = tray.scan_worktrees(repo, idle_hours=0, stuck_hours=9999)
+            branches_merged = [e["branch"] for e in result["merged"]]
+            self.assertIn("feat", branches_merged)
+            self.assertEqual(result["idle"], [])
+            self.assertEqual(result["stuck"], [])
 
     @unittest.skipUnless(HAVE_GIT, "git not available")
     def test_scan_dirty_no_stale_when_disabled(self):
