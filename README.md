@@ -75,7 +75,16 @@ SONAR_URL=http://localhost:9000 SONAR_TOKEN=squ_xxx repodash --sonar --dirty
 - **todo** — `TODO`/`FIXME`/`HACK` in comment context (preceded by `//`, `#`, `<!--`, `--`, or `*`), in source/config files only (generated dirs, `.venv`/`node_modules`, lockfiles and markdown excluded). Up to `--max-todos` shown, with an exact `… and N more`.
 - **audit** — `.md`/`.txt` files whose name contains `audit`, `security-review`, `SECURITY`, `vulnerability`, or `pentest`. Open checklist items (`- [ ]` / `* [ ]`, indented sub-tasks included) are listed; dated files (`YYYY-MM-DD…`) are collapsed into an archive count with the most recent surfaced.
 - **roadmap** — open checklist items in `ROADMAP.md` / `TODO.md` / `BACKLOG.md`, with line numbers.
-- **sonar** — live metrics from the SonarQube API for repos with `sonar-project.properties`. A genuine network failure shows `API unreachable`; an HTTP error surfaces the server's own message (e.g. *Insufficient privileges*) or `HTTP <code>`.
+- **sonar** — live metrics from the SonarQube API for repos with `sonar-project.properties`. A genuine network failure shows `API unreachable`; an HTTP error surfaces the server's own message (e.g. *Insufficient privileges*) or `HTTP <code>`. It also runs an **onboarding audit** (see below).
+
+### Sonar onboarding audit
+
+Because a repo that silently skips Sonar emits no signal from *inside* itself, only an outside sweep can spot the gap. The `--sonar` section flags two of them for any JS/TS code project (one with a `package.json`):
+
+- **not onboarded** — a `package.json` but no `sonar-project.properties`: `⚠ code project not onboarded to Sonar`.
+- **no gate** — onboarded, but the `package.json` has no `"sonar:gate"` npm script: `⚠ no pre-push sonar:gate ratchet` (shown independent of server reachability, so drift-ungated repos surface even when the API is down).
+
+To acknowledge a deliberate deferral, add a **`.sonar-optout`** file whose first line is the reason. The yellow warning is then replaced by a dim, acknowledged note (`… — opt-out: <reason>`), so a validated choice (e.g. running local scans but skipping the pre-push gate on a single-contributor repo) is never nagged. Repos with no `package.json` (papers, config, docs) are never flagged.
 
 ## `--json` schema
 
@@ -101,13 +110,15 @@ Top-level object (stable; `schema_version` bumps only on breaking changes). The 
       "roadmap": { "files": [{"path": "ROADMAP.md",
                               "items": [{"path": "ROADMAP.md", "line": 8, "text": "v2 launch"}]}] },
       "sonar": { "configured": true, "ok": true, "error": null, "project_key": "projectA",
-                 "metrics": {"bugs": 0, "vulnerabilities": 1, "coverage": 84.5} }
+                 "metrics": {"bugs": 0, "vulnerabilities": 1, "coverage": 84.5},
+                 "onboarding": {"has_package_json": true, "has_sonar_gate": false,
+                                "optout_reason": null} }
     }
   ]
 }
 ```
 
-Rules: every section key is always present (empty arrays / `null`, never omitted); Sonar metrics are JSON numbers; `sonar.configured: false` (no properties file) is distinct from `configured: true, ok: false, error: "…"`.
+Rules: every section key is always present (empty arrays / `null`, never omitted); Sonar metrics are JSON numbers; `sonar.configured: false` (no properties file) is distinct from `configured: true, ok: false, error: "…"`. `sonar.onboarding` is always present: `optout_reason` is the first line of a `.sonar-optout` marker, or `null` when there is none.
 
 ## GNOME tray (Linux)
 
