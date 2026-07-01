@@ -63,6 +63,12 @@ OPTIONS
 ENVIRONMENT
   REPODASH_DIR, SONAR_URL, SONAR_TOKEN, REPODASH_DEPTH,
   REPODASH_MAX_TODOS, NO_COLOR, COLUMNS
+
+SONAR ONBOARDING AUDIT
+  The --sonar section flags JS/TS code projects (those with a package.json)
+  that are not onboarded to Sonar, or are onboarded but lack a pre-push
+  sonar:gate ratchet. Add a .sonar-optout file (first line = reason) to a
+  repo to acknowledge a deliberate deferral and silence the warning.
 EOF
   exit 0
 }
@@ -330,6 +336,20 @@ roadmap_json() {
 sonar_collect() {
   local repo="$1" props="$repo/sonar-project.properties"
   S_CONFIGURED=false; S_OK=null; S_ERR=""; S_KEY=""; S_MK=(); S_MV=()
+  # onboarding-audit signals — independent of props file and server reachability:
+  # a JS/TS code project (package.json) that is not onboarded, or onboarded but
+  # missing a pre-push `sonar:gate`. A `.sonar-optout` marker (first line = reason)
+  # downgrades the warning to a dim, acknowledged note (e.g. coachcompanion D-011).
+  local pkg="$repo/package.json" marker="$repo/.sonar-optout"
+  S_HAS_PKG=false; S_HAS_GATE=false; S_HAS_OPTOUT=false; S_OPTOUT_REASON=""
+  if [ -f "$pkg" ]; then
+    S_HAS_PKG=true
+    grep -qE '"sonar:gate"[[:space:]]*:' "$pkg" 2>/dev/null && S_HAS_GATE=true
+  fi
+  if [ -f "$marker" ]; then
+    S_HAS_OPTOUT=true
+    S_OPTOUT_REASON=$(head -1 "$marker" 2>/dev/null | tr -d '\r')
+  fi
   [ -f "$props" ] || return 0
   S_CONFIGURED=true
   local key host
@@ -397,8 +417,13 @@ sonar_json() {
   fi
   local key_json=null; [ -n "$S_KEY" ] && key_json=$(json_str "$S_KEY")
   local err_json=null; [ -n "$S_ERR" ] && err_json=$(json_str "$S_ERR")
-  printf '{"configured":%s,"error":%s,"metrics":%s,"ok":%s,"project_key":%s}' \
-    "$S_CONFIGURED" "$err_json" "$metrics_json" "$S_OK" "$key_json"
+  local optout_json=null
+  [ "$S_HAS_OPTOUT" = "true" ] && optout_json=$(json_str "$S_OPTOUT_REASON")
+  local onboarding_json
+  onboarding_json=$(printf '{"has_package_json":%s,"has_sonar_gate":%s,"optout_reason":%s}' \
+    "$S_HAS_PKG" "$S_HAS_GATE" "$optout_json")
+  printf '{"configured":%s,"error":%s,"metrics":%s,"ok":%s,"onboarding":%s,"project_key":%s}' \
+    "$S_CONFIGURED" "$err_json" "$metrics_json" "$S_OK" "$onboarding_json" "$key_json"
 }
 
 # ── repo model + json document ───────────────────────────────────────────────
@@ -485,8 +510,30 @@ render_repo() {
   fi
   if [ "$SHOW_SONAR" -eq 1 ]; then
     sonar_collect "$repo"
-    if [ "$S_CONFIGURED" = "true" ]; then
+    local sreason=""
+    if [ "$S_CONFIGURED" != "true" ]; then
+      # not onboarded: flag JS/TS code projects missing sonar-project.properties
+      if [ "$S_HAS_PKG" = "true" ]; then
+        has=1
+        if [ "$S_HAS_OPTOUT" = "true" ]; then
+          sreason="$S_OPTOUT_REASON"; [ -z "$sreason" ] && sreason="see .sonar-optout"
+          row "sonar" "${DIM}not onboarded — opt-out: ${sreason}${NC}"
+        else
+          row "sonar" "${YELLOW}⚠ code project not onboarded to Sonar${NC}"
+          row "sonar" "${DIM}  no sonar-project.properties — add one, or a .sonar-optout marker with a reason${NC}"
+        fi
+      fi
+    else
       has=1
+      # onboarded but no pre-push sonar:gate ratchet (before the API result line)
+      if [ "$S_HAS_PKG" = "true" ] && [ "$S_HAS_GATE" != "true" ]; then
+        if [ "$S_HAS_OPTOUT" = "true" ]; then
+          sreason="$S_OPTOUT_REASON"; [ -z "$sreason" ] && sreason="see .sonar-optout"
+          row "sonar" "${DIM}no pre-push sonar:gate ratchet — opt-out: ${sreason}${NC}"
+        else
+          row "sonar" "${YELLOW}⚠ no pre-push sonar:gate ratchet${NC} ${DIM}(onboarded but drift is ungated)${NC}"
+        fi
+      fi
       if [ "$S_OK" != "true" ]; then
         row "sonar" "${RED}${S_ERR}${NC}"
       else

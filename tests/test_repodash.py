@@ -139,6 +139,65 @@ class TestModel(unittest.TestCase):
                 self.assertIn(key, r)
 
 
+# ── sonar onboarding audit (model + render) ──────────────────────────────────
+class TestOnboarding(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = normalize(run_py(_TREE, "--json"))
+        cls.render = run_py(_TREE, "--sonar", "--no-color", "--width", "100")
+
+    def _onb(self, name):
+        return repo(self.doc, name)["sonar"]["onboarding"]
+
+    def test_not_onboarded_flag(self):
+        s = repo(self.doc, "jsnoonboard")["sonar"]
+        self.assertFalse(s["configured"])
+        self.assertTrue(s["onboarding"]["has_package_json"])
+        self.assertIsNone(s["onboarding"]["optout_reason"])
+        self.assertIn("⚠ code project not onboarded to Sonar", self.render)
+        self.assertIn("no sonar-project.properties — add one, or a .sonar-optout",
+                      self.render)
+
+    def test_no_gate_flag(self):
+        s = repo(self.doc, "jsgateless")["sonar"]
+        self.assertTrue(s["configured"])
+        self.assertTrue(s["onboarding"]["has_package_json"])
+        self.assertFalse(s["onboarding"]["has_sonar_gate"])
+        self.assertIn("⚠ no pre-push sonar:gate ratchet", self.render)
+        self.assertIn("(onboarded but drift is ungated)", self.render)
+
+    def test_gate_present_no_flag(self):
+        # onboarded + a real sonar:gate script → no warning, no false positive
+        self.assertTrue(self._onb("jsgated")["has_sonar_gate"])
+
+    def test_optout_not_onboarded(self):
+        onb = self._onb("optoutnoonboard")
+        self.assertEqual(onb["optout_reason"],
+                         "prototype spike — not worth onboarding yet")
+        self.assertIn("not onboarded — opt-out: prototype spike", self.render)
+
+    def test_optout_gate(self):
+        onb = self._onb("optoutgate")
+        self.assertEqual(onb["optout_reason"],
+                         "D-011: single-contributor repo, local scans only")
+        self.assertIn("no pre-push sonar:gate ratchet — opt-out: D-011", self.render)
+
+    def test_optout_suppresses_warning(self):
+        # a .sonar-optout marker must replace the yellow ⚠ with a dim note
+        self.assertNotIn("⚠ code project not onboarded to Sonar\n"
+                         "  no sonar-project.properties", self.render)
+        # the opt-out repos never emit the bare warning phrasing
+        for line in self.render.splitlines():
+            if "opt-out" in line:
+                self.assertNotIn("⚠", line)
+
+    def test_non_js_repo_no_flag(self):
+        # repoC has no package.json → no onboarding signal, no sonar line at all
+        onb = self._onb("repoC")
+        self.assertFalse(onb["has_package_json"])
+        self.assertFalse(repo(self.doc, "repoC")["sonar"]["configured"])
+
+
 # ── rendering ────────────────────────────────────────────────────────────────
 class TestRender(unittest.TestCase):
     def test_backslash_literal_in_render(self):

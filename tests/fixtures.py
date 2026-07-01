@@ -104,6 +104,44 @@ def build(root):
     _write(os.path.join(s, "sonar-project.properties"), "sonar.projectKey=mykey\n")
     _commit(s, "init")
 
+    # ── Sonar onboarding audit fixtures ──────────────────────────────────────
+    # jsnoonboard — JS project (package.json), NOT onboarded → not-onboarded flag
+    jn = _init(os.path.join(root, "jsnoonboard"))
+    _write(os.path.join(jn, "package.json"),
+           '{"name": "jsnoonboard", "scripts": {"build": "tsc"}}\n')
+    _commit(jn, "init")
+
+    # jsgateless — onboarded (properties) + package.json with NO sonar:gate → no-gate flag
+    jg = _init(os.path.join(root, "jsgateless"))
+    _write(os.path.join(jg, "sonar-project.properties"), "sonar.projectKey=jsgateless\n")
+    _write(os.path.join(jg, "package.json"),
+           '{"name": "jsgateless", "scripts": {"test": "jest"}}\n')
+    _commit(jg, "init")
+
+    # jsgated — onboarded + package.json WITH a sonar:gate script → no flag
+    jd = _init(os.path.join(root, "jsgated"))
+    _write(os.path.join(jd, "sonar-project.properties"), "sonar.projectKey=jsgated\n")
+    _write(os.path.join(jd, "package.json"),
+           '{"name": "jsgated", "scripts": {"sonar:gate": "node scripts/gate.js"}}\n')
+    _commit(jd, "init")
+
+    # optoutnoonboard — not onboarded but a .sonar-optout marker → dim opt-out note
+    on = _init(os.path.join(root, "optoutnoonboard"))
+    _write(os.path.join(on, "package.json"),
+           '{"name": "optoutnoonboard", "scripts": {"build": "tsc"}}\n')
+    _write(os.path.join(on, ".sonar-optout"),
+           "prototype spike — not worth onboarding yet\n")
+    _commit(on, "init")
+
+    # optoutgate — onboarded, no sonar:gate, but a .sonar-optout marker → dim opt-out note
+    og = _init(os.path.join(root, "optoutgate"))
+    _write(os.path.join(og, "sonar-project.properties"), "sonar.projectKey=optoutgate\n")
+    _write(os.path.join(og, "package.json"),
+           '{"name": "optoutgate", "scripts": {"test": "jest"}}\n')
+    _write(os.path.join(og, ".sonar-optout"),
+           "D-011: single-contributor repo, local scans only\n")
+    _commit(og, "init")
+
     # diverged — bare remote + clone diverged to ahead 1 / behind 1, dirty file
     _build_diverged(root)
 
@@ -136,7 +174,8 @@ def _build_diverged(root):
 # and a bare repo has none, so it is naturally skipped.
 EXPECTED_REPO_NAMES = {
     "repoA", "repoB", "repoC", "my repo", "repoD", "sonarrepo", "diverged",
-    "special",
+    "special", "jsnoonboard", "jsgateless", "jsgated", "optoutnoonboard",
+    "optoutgate",
 }
 
 

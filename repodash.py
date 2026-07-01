@@ -369,25 +369,59 @@ def fetch_sonar(url: str, key: str, token: str, insecure: bool, timeout: int = 1
     return {"ok": True, "error": None, "metrics": metrics}
 
 
+SONAR_GATE_RE = re.compile(r'"sonar:gate"\s*:')
+
+
+def _onboarding(repo: str) -> dict:
+    """Onboarding-audit signals — independent of the props file and the server.
+
+    Cross-repo prevention: a fork that silently skips Sonar emits no signal from
+    inside itself, so only an outside sweep like this can see the gap. We surface
+    (a) a JS/TS code project (has package.json) with no sonar-project.properties,
+    and (b) an onboarded project whose package.json has no pre-push `sonar:gate`
+    ratchet. A `.sonar-optout` marker (first line = reason) turns the warning into
+    a dim, acknowledged note, honoring documented deferrals (e.g. coachcompanion
+    D-011) so this never nags a validated choice.
+    """
+    has_pkg = os.path.isfile(os.path.join(repo, "package.json"))
+    has_gate = False
+    if has_pkg:
+        try:
+            with open(os.path.join(repo, "package.json"), "r",
+                      encoding="utf-8", errors="replace") as fh:
+                has_gate = SONAR_GATE_RE.search(fh.read()) is not None
+        except OSError:
+            has_gate = False
+    optout_reason = None
+    marker = os.path.join(repo, ".sonar-optout")
+    if os.path.isfile(marker):
+        lines = _read_lines(marker)
+        optout_reason = lines[0].rstrip("\r") if lines else ""
+    return {"has_package_json": has_pkg, "has_sonar_gate": has_gate,
+            "optout_reason": optout_reason}
+
+
 def section_sonar(repo: str, cfg) -> dict:
+    onb = _onboarding(repo)
     props = os.path.join(repo, "sonar-project.properties")
     if not os.path.isfile(props):
         return {"configured": False, "ok": None, "error": None,
-                "project_key": None, "metrics": None}
+                "project_key": None, "metrics": None, "onboarding": onb}
 
     key, host = _read_props(props)
     url = cfg.sonar_url or host or ""
     if not url:
         return {"configured": True, "ok": False,
                 "error": "sonar-project.properties found — set SONAR_URL to fetch stats",
-                "project_key": key, "metrics": None}
+                "project_key": key, "metrics": None, "onboarding": onb}
     if not key:
         return {"configured": True, "ok": False,
                 "error": "sonar.projectKey missing in sonar-project.properties",
-                "project_key": None, "metrics": None}
+                "project_key": None, "metrics": None, "onboarding": onb}
     res = fetch_sonar(url, key, cfg.sonar_token, cfg.insecure)
     res["configured"] = True
     res["project_key"] = key
+    res["onboarding"] = onb
     return res
 
 
@@ -416,7 +450,8 @@ def repo_has_content(m: dict, cfg) -> bool:
         return True
     if cfg.show_roadmap and any(f["items"] for f in m["roadmap"]["files"]):
         return True
-    if cfg.show_sonar and m["sonar"]["configured"]:
+    if cfg.show_sonar and (m["sonar"]["configured"]
+                           or m["sonar"]["onboarding"]["has_package_json"]):
         return True
     return False
 
@@ -540,10 +575,36 @@ def _render_roadmap(roadmap: dict, p: Palette):
 
 
 def _render_sonar(sonar: dict, p: Palette):
+    onb = sonar["onboarding"]
+    out = []
     if not sonar["configured"]:
-        return []
+        # onboarding audit: a code project (has package.json) not onboarded.
+        if onb["has_package_json"]:
+            if onb["optout_reason"] is not None:
+                reason = onb["optout_reason"] or "see .sonar-optout"
+                out.append(_row(p, "sonar",
+                                f"{p.DIM}not onboarded — opt-out: {reason}{p.NC}"))
+            else:
+                out.append(_row(p, "sonar",
+                                f"{p.YELLOW}⚠ code project not onboarded to Sonar{p.NC}"))
+                out.append(_row(p, "sonar",
+                                f"{p.DIM}  no sonar-project.properties — add one, "
+                                f"or a .sonar-optout marker with a reason{p.NC}"))
+        return out
+    # onboarded but no pre-push sonar:gate ratchet — shown regardless of server
+    # reachability (before the API result line).
+    if onb["has_package_json"] and not onb["has_sonar_gate"]:
+        if onb["optout_reason"] is not None:
+            reason = onb["optout_reason"] or "see .sonar-optout"
+            out.append(_row(p, "sonar",
+                            f"{p.DIM}no pre-push sonar:gate ratchet — opt-out: {reason}{p.NC}"))
+        else:
+            out.append(_row(p, "sonar",
+                            f"{p.YELLOW}⚠ no pre-push sonar:gate ratchet{p.NC} "
+                            f"{p.DIM}(onboarded but drift is ungated){p.NC}"))
     if not sonar["ok"]:
-        return [_row(p, "sonar", f"{p.RED}{sonar['error']}{p.NC}")]
+        out.append(_row(p, "sonar", f"{p.RED}{sonar['error']}{p.NC}"))
+        return out
     m = sonar["metrics"] or {}
 
     def g(k):
@@ -554,12 +615,13 @@ def _render_sonar(sonar: dict, p: Palette):
         return c if (v != 0 and v != "-") else p.NC
 
     bugs, vulns, hot = g("bugs"), g("vulnerabilities"), g("security_hotspots")
-    return [_row(p, "sonar",
-                 f"bugs:{col('bugs', p.RED)}{bugs}{p.NC}  "
-                 f"vulns:{col('vulnerabilities', p.RED)}{vulns}{p.NC}  "
-                 f"hotspots:{col('security_hotspots', p.YELLOW)}{hot}{p.NC}  "
-                 f"smells:{g('code_smells')}  "
-                 f"coverage:{g('coverage')}%  dup:{g('duplicated_lines_density')}%")]
+    out.append(_row(p, "sonar",
+                    f"bugs:{col('bugs', p.RED)}{bugs}{p.NC}  "
+                    f"vulns:{col('vulnerabilities', p.RED)}{vulns}{p.NC}  "
+                    f"hotspots:{col('security_hotspots', p.YELLOW)}{hot}{p.NC}  "
+                    f"smells:{g('code_smells')}  "
+                    f"coverage:{g('coverage')}%  dup:{g('duplicated_lines_density')}%"))
+    return out
 
 
 # ── config / CLI ─────────────────────────────────────────────────────────────
@@ -570,7 +632,14 @@ class Config:
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         prog="repodash", add_help=True,
-        description="multi-repo dashboard: git, TODOs, audits, roadmap, SonarQube")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="multi-repo dashboard: git, TODOs, audits, roadmap, SonarQube",
+        epilog=(
+            "SONAR ONBOARDING AUDIT\n"
+            "  The --sonar section flags JS/TS code projects (those with a package.json)\n"
+            "  that are not onboarded to Sonar, or are onboarded but lack a pre-push\n"
+            "  sonar:gate ratchet. Add a .sonar-optout file (first line = reason) to a\n"
+            "  repo to acknowledge a deliberate deferral and silence the warning.\n"))
     ap.add_argument("dir", nargs="?", help="base directory to scan")
     for s in ("git", "todos", "audit", "roadmap", "sonar"):
         ap.add_argument(f"--{s}", action="store_true", help=f"show only {s} sections")
