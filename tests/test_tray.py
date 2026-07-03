@@ -5,7 +5,10 @@ The GUI layer keeps all ``gi`` imports inside ``run_gui()``, so the module
 imports cleanly here and we can test the data/action helpers in isolation.
 Git-backed tests skip when git is unavailable; everything else always runs.
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import shutil
 import subprocess
@@ -120,6 +123,12 @@ class TerminalArgvTest(unittest.TestCase):
                          ["ghostty", "--working-directory=/x"])
         self.assertEqual(tray.terminal_argv("xterm", "/x"), ["xterm"])
 
+    def test_ghostty_and_xterm_with_command(self):
+        argv = tray.terminal_argv("ghostty", "/x", "claude")
+        self.assertIn("claude; exec bash", argv)
+        argv = tray.terminal_argv("xterm", "/x", "claude")
+        self.assertIn("claude; exec bash", argv)
+
     def test_absolute_path_uses_basename_dialect(self):
         self.assertEqual(
             tray.terminal_argv("/usr/bin/ptyxis", "/x"),
@@ -148,6 +157,15 @@ class DetectTerminalTest(unittest.TestCase):
         os.environ["REPODASH_TERMINAL"] = "definitely-not-a-real-terminal-xyz"
         self.assertIsNone(tray.detect_terminal())
 
+    def test_no_override_and_none_on_path_returns_none(self):
+        os.environ.pop("REPODASH_TERMINAL", None)
+        orig_which = tray.shutil.which
+        tray.shutil.which = lambda _: None
+        try:
+            self.assertIsNone(tray.detect_terminal())
+        finally:
+            tray.shutil.which = orig_which
+
 
 class PushActionTest(unittest.TestCase):
     def test_open_push_uses_git_push_in_terminal(self):
@@ -166,59 +184,96 @@ class PushActionTest(unittest.TestCase):
                 os.environ["REPODASH_TERMINAL"] = saved
 
 
+class ClipboardArgvTest(unittest.TestCase):
+    def setUp(self):
+        self._wayland = os.environ.get("WAYLAND_DISPLAY")
+
+    def tearDown(self):
+        if self._wayland is None:
+            os.environ.pop("WAYLAND_DISPLAY", None)
+        else:
+            os.environ["WAYLAND_DISPLAY"] = self._wayland
+
+    def test_wayland_uses_wl_copy(self):
+        os.environ["WAYLAND_DISPLAY"] = "wayland-0"
+        self.assertEqual(tray.clipboard_argv(), ["wl-copy"])
+
+    def test_no_wayland_uses_xclip(self):
+        os.environ.pop("WAYLAND_DISPLAY", None)
+        self.assertEqual(tray.clipboard_argv(),
+                         ["xclip", "-selection", "clipboard"])
+
+
 class CopyToClipboardTest(unittest.TestCase):
-    """copy_to_clipboard() takes a Gtk.Clipboard-shaped object, so a plain stub
-    exercises it without needing GTK. RCA (2026-07-03): 'Copy path' was the one
-    tray action that never called notify(), so a raised exception (clipboard
-    manager errors happen on some Wayland/XWayland setups) was swallowed by
-    GTK's signal dispatch and printed to stderr — invisible to the user, who
-    just saw the action silently do nothing.
+    """copy_to_clipboard() shells out to wl-copy/xclip rather than using
+    Gtk.Clipboard. RCA (2026-07-03): 'Copy path' was the one tray action that
+    never called notify(), and even after wiring notify() in, Gtk.Clipboard's
+    set_text()/store() both return normally when the clipboard manager can't
+    take selection ownership from an unfocused tray-menu context (the classic
+    Wayland/XWayland tray-clipboard failure) — there's no exception to catch,
+    so notify() alone can't surface it either. Shelling out to a dedicated
+    clipboard tool (which forks and serves the selection independently of our
+    GTK event loop) gives a real exit code to report through notify(), the
+    same pattern open_folder/open_terminal already use for xdg-open/terminals.
     """
 
-    class _OkClipboard:
-        def __init__(self):
-            self.text = None
-            self.stored = False
+    def setUp(self):
+        self._which = tray.shutil.which
+        self._run = tray.subprocess.run
 
-        def set_text(self, text, length):
-            self.text = text
+    def tearDown(self):
+        tray.shutil.which = self._which
+        tray.subprocess.run = self._run
 
-        def store(self):
-            self.stored = True
+    def test_missing_tool_reports_clearly(self):
+        tray.shutil.which = lambda _: None
+        ok, msg = tray.copy_to_clipboard("/home/user/repo")
+        self.assertFalse(ok)
+        self.assertIn("not found on PATH", msg)
 
-    class _RaisingClipboard:
-        def __init__(self, exc):
-            self._exc = exc
+    def test_success(self):
+        tray.shutil.which = lambda _: "/usr/bin/tool"
+        seen = {}
 
-        def set_text(self, text, length):
-            raise self._exc
+        def fake_run(argv, input=None, text=None, capture_output=None, timeout=None):
+            seen["argv"] = argv
+            seen["input"] = input
 
-        def store(self):
-            pass
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
 
-    def test_success_sets_and_stores_text(self):
-        clip = self._OkClipboard()
-        ok, msg = tray.copy_to_clipboard(clip, "/home/user/repo")
+        tray.subprocess.run = fake_run
+        ok, msg = tray.copy_to_clipboard("/home/user/repo")
         self.assertTrue(ok)
         self.assertEqual(msg, "")
-        self.assertEqual(clip.text, "/home/user/repo")
-        self.assertTrue(clip.stored)
+        self.assertEqual(seen["input"], "/home/user/repo")
 
-    def test_exception_is_caught_and_reported(self):
-        clip = self._RaisingClipboard(RuntimeError("no clipboard manager"))
-        ok, msg = tray.copy_to_clipboard(clip, "/home/user/repo")
+    def test_nonzero_exit_reports_stderr(self):
+        tray.shutil.which = lambda _: "/usr/bin/tool"
+
+        def fake_run(argv, input=None, text=None, capture_output=None, timeout=None):
+            class R:
+                returncode = 1
+                stderr = "no clipboard manager running\n"
+            return R()
+
+        tray.subprocess.run = fake_run
+        ok, msg = tray.copy_to_clipboard("/x")
         self.assertFalse(ok)
-        self.assertIn("no clipboard manager", msg)
+        self.assertIn("no clipboard manager running", msg)
 
-    def test_store_exception_is_also_caught(self):
-        class _StoreRaises(CopyToClipboardTest._OkClipboard):
-            def store(self):
-                raise RuntimeError("store failed")
+    def test_subprocess_error_is_caught(self):
+        tray.shutil.which = lambda _: "/usr/bin/tool"
 
-        clip = _StoreRaises()
-        ok, msg = tray.copy_to_clipboard(clip, "/x")
+        def fake_run(*a, **k):
+            raise OSError("boom")
+
+        tray.subprocess.run = fake_run
+        ok, msg = tray.copy_to_clipboard("/x")
         self.assertFalse(ok)
-        self.assertIn("store failed", msg)
+        self.assertIn("boom", msg)
 
 
 class AutostartTest(unittest.TestCase):
@@ -853,6 +908,661 @@ class StaleWorktreeTest(unittest.TestCase):
     def test_format_age_days(self):
         self.assertEqual(tray._format_age(48), "2.0d")
         self.assertEqual(tray._format_age(72), "3.0d")
+
+
+class DepthIntervalEnvTest(unittest.TestCase):
+    def test_scan_depth_invalid_env_falls_back(self):
+        saved = os.environ.get("REPODASH_DEPTH")
+        os.environ["REPODASH_DEPTH"] = "not-a-number"
+        try:
+            self.assertEqual(tray.scan_depth(), tray.DEFAULT_DEPTH)
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_DEPTH", None)
+            else:
+                os.environ["REPODASH_DEPTH"] = saved
+
+    def test_refresh_interval_invalid_env_falls_back(self):
+        saved = os.environ.get("REPODASH_TRAY_INTERVAL")
+        os.environ["REPODASH_TRAY_INTERVAL"] = "nope"
+        try:
+            self.assertEqual(tray.refresh_interval(), tray.DEFAULT_INTERVAL)
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_TRAY_INTERVAL", None)
+            else:
+                os.environ["REPODASH_TRAY_INTERVAL"] = saved
+
+    def test_apply_config_sets_interval(self):
+        saved = os.environ.get("REPODASH_TRAY_INTERVAL")
+        os.environ.pop("REPODASH_TRAY_INTERVAL", None)
+        try:
+            tray.apply_config_to_env({"base_dir": "", "depth": 0,
+                                      "refresh_interval": 120, "terminal": ""})
+            self.assertEqual(os.environ.get("REPODASH_TRAY_INTERVAL"), "120")
+        finally:
+            if saved is None:
+                os.environ.pop("REPODASH_TRAY_INTERVAL", None)
+            else:
+                os.environ["REPODASH_TRAY_INTERVAL"] = saved
+
+
+class SaveConfigErrorTest(unittest.TestCase):
+    def test_unwritable_path_is_swallowed(self):
+        orig = tray.config_file
+        tmp = tempfile.mkdtemp(prefix="repodash-saveerr-")
+        blocker = os.path.join(tmp, "blocker")
+        with open(blocker, "w") as f:
+            f.write("x")
+        # A file where a directory needs to be created — makedirs must OSError.
+        tray.config_file = lambda: os.path.join(blocker, "sub", "config.json")
+        try:
+            tray.save_config({"a": 1})  # must not raise
+        finally:
+            tray.config_file = orig
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class GitHelperTest(unittest.TestCase):
+    def test_git_exception_returns_empty_string(self):
+        orig = tray.subprocess.run
+
+        def raiser(*a, **k):
+            raise OSError("boom")
+
+        tray.subprocess.run = raiser
+        try:
+            self.assertEqual(tray._git("/tmp", "status"), "")
+        finally:
+            tray.subprocess.run = orig
+
+
+class FindRepoDepthPruneTest(unittest.TestCase):
+    def test_deep_nondir_repo_not_descended_past_depth(self):
+        with tempfile.TemporaryDirectory() as base:
+            deep = os.path.join(base, "a", "b", "c", "d")
+            os.makedirs(deep, exist_ok=True)
+            self.assertEqual(tray.find_repos(base, depth=1), [])
+
+
+class ParseWorktreeListTest(unittest.TestCase):
+    def test_detached_and_bare_and_normal_entries(self):
+        raw = (
+            "worktree /repo\n"
+            "branch refs/heads/main\n"
+            "\n"
+            "worktree /repo/wt-detached\n"
+            "detached\n"
+            "\n"
+            "worktree /repo/wt-bare\n"
+            "bare\n"
+            "\n"
+            "worktree /repo/wt-feat\n"
+            "branch refs/heads/feat\n"
+        )
+        entries = tray._parse_worktree_list(raw)
+        by_path = {e["path"]: e for e in entries}
+        self.assertEqual(by_path["/repo"]["branch"], "main")
+        self.assertEqual(by_path["/repo/wt-detached"]["branch"], "(detached)")
+        self.assertNotIn("/repo/wt-bare", by_path)  # bare worktrees excluded
+        self.assertEqual(by_path["/repo/wt-feat"]["branch"], "feat")
+
+
+class ScanWorktreesEarlyReturnTest(unittest.TestCase):
+    def test_no_worktree_output_returns_empty_result(self):
+        result = tray.scan_worktrees("/no/such/repo-xyz", 24, 12)
+        self.assertEqual(result, {"stuck": [], "idle": [], "merged": []})
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_missing_worktree_dir_is_skipped(self):
+        with tempfile.TemporaryDirectory() as base:
+            repo = os.path.join(base, "repo")
+            _init_repo(repo)
+            _commit(repo)
+            wt = os.path.join(base, "wt")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "-q",
+                           "-b", "feat", wt], check=True)
+            shutil.rmtree(wt)  # removed on disk without telling git
+            result = tray.scan_worktrees(repo, 0, 0)
+            self.assertEqual(result, {"stuck": [], "idle": [], "merged": []})
+
+
+class OpenActionsTest(unittest.TestCase):
+    def setUp(self):
+        self._detect = tray.detect_terminal
+        self._targv = tray.terminal_argv
+        self._popen = tray.subprocess.Popen
+        self._which = tray.shutil.which
+        self._open_terminal = tray.open_terminal
+        self._github_url = tray.github_url
+        self._open_url = tray.open_url
+
+    def tearDown(self):
+        tray.detect_terminal = self._detect
+        tray.terminal_argv = self._targv
+        tray.subprocess.Popen = self._popen
+        tray.shutil.which = self._which
+        tray.open_terminal = self._open_terminal
+        tray.github_url = self._github_url
+        tray.open_url = self._open_url
+
+    def test_spawn_success(self):
+        ok, msg = tray._spawn(["true"])
+        self.assertTrue(ok)
+        self.assertIsNone(msg)
+
+    def test_spawn_failure(self):
+        ok, msg = tray._spawn(["definitely-not-a-real-binary-xyz"])
+        self.assertFalse(ok)
+        self.assertTrue(msg)
+
+    def test_open_terminal_no_terminal_found(self):
+        tray.detect_terminal = lambda: None
+        ok, msg = tray.open_terminal("/x")
+        self.assertFalse(ok)
+        self.assertIn("no terminal found", msg)
+
+    def test_open_terminal_success(self):
+        tray.detect_terminal = lambda: "ptyxis"
+        tray.terminal_argv = lambda *a, **k: ["true"]
+        ok, _ = tray.open_terminal(tempfile.gettempdir())
+        self.assertTrue(ok)
+
+    def test_open_claude_delegates_to_open_terminal(self):
+        seen = {}
+
+        def fake_open_terminal(path, command=None):
+            seen["path"] = path
+            seen["command"] = command
+            return True, None
+
+        tray.open_terminal = fake_open_terminal
+        ok, _ = tray.open_claude("/x")
+        self.assertTrue(ok)
+        self.assertEqual(seen["command"], tray.CLAUDE_COMMAND)
+
+    def test_open_url_no_url(self):
+        ok, msg = tray.open_url("")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "no URL")
+
+    def test_open_url_spawns_xdg_open(self):
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen["argv"] = argv
+
+            class P:
+                pass
+            return P()
+
+        tray.subprocess.Popen = fake_popen
+        ok, _ = tray.open_url("https://example.com")
+        self.assertTrue(ok)
+        self.assertEqual(seen["argv"], ["xdg-open", "https://example.com"])
+
+    def test_open_github_no_remote(self):
+        tray.github_url = lambda path: None
+        ok, msg = tray.open_github("/x")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "no GitHub remote")
+
+    def test_open_github_opens_url(self):
+        tray.github_url = lambda path: "https://github.com/x/y"
+        seen = {}
+
+        def fake_open_url(url):
+            seen["url"] = url
+            return True, None
+
+        tray.open_url = fake_open_url
+        ok, _ = tray.open_github("/x")
+        self.assertTrue(ok)
+        self.assertEqual(seen["url"], "https://github.com/x/y")
+
+    def test_open_folder_calls_xdg_open(self):
+        seen = {}
+
+        def fake_popen(argv, **kw):
+            seen["argv"] = argv
+
+            class P:
+                pass
+            return P()
+
+        tray.subprocess.Popen = fake_popen
+        ok, _ = tray.open_folder("/x")
+        self.assertTrue(ok)
+        self.assertEqual(seen["argv"], ["xdg-open", "/x"])
+
+    def test_open_commit_uses_add_and_commit(self):
+        seen = {}
+
+        def fake(path, command=None):
+            seen["command"] = command
+            return True, None
+
+        tray.open_terminal = fake
+        tray.open_commit("/x")
+        self.assertEqual(seen["command"], "git add -A && git commit")
+
+    def test_open_wt_claude_no_claude(self):
+        tray.shutil.which = lambda _: None
+        ok, msg = tray.open_wt_claude("/x", "prompt")
+        self.assertFalse(ok)
+        self.assertIn("claude not found", msg)
+
+    def test_open_wt_claude_success(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+        seen = {}
+
+        def fake(path, command=None):
+            seen["command"] = command
+            return True, None
+
+        tray.open_terminal = fake
+        ok, _ = tray.open_wt_claude("/x", "do the thing")
+        self.assertTrue(ok)
+        self.assertIn("do the thing", seen["command"])
+
+
+class RemoveWorktreeTest(unittest.TestCase):
+    def setUp(self):
+        self._run = tray.subprocess.run
+
+    def tearDown(self):
+        tray.subprocess.run = self._run
+
+    def test_remove_failure_returns_output(self):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "fatal: not a worktree"
+        tray.subprocess.run = lambda *a, **k: R()
+        ok, msg = tray.remove_worktree("/repo", "/repo/wt")
+        self.assertFalse(ok)
+        self.assertIn("fatal", msg)
+
+    def test_remove_success_no_branch(self):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        ok, _ = tray.remove_worktree("/repo", "/repo/wt")
+        self.assertTrue(ok)
+
+    def test_remove_success_with_branch_delete(self):
+        calls = {"n": 0}
+
+        def fake_run(argv, **kw):
+            calls["n"] += 1
+
+            class R:
+                returncode = 0
+                stdout = "Deleted branch feat" if "branch" in argv else ""
+                stderr = ""
+            return R()
+
+        tray.subprocess.run = fake_run
+        ok, msg = tray.remove_worktree("/repo", "/repo/wt", branch="feat")
+        self.assertTrue(ok)
+        self.assertIn("Deleted branch feat", msg)
+        self.assertEqual(calls["n"], 2)
+
+    def test_remove_exception(self):
+        def raiser(*a, **k):
+            raise OSError("boom")
+        tray.subprocess.run = raiser
+        ok, msg = tray.remove_worktree("/repo", "/repo/wt")
+        self.assertFalse(ok)
+        self.assertIn("boom", msg)
+
+
+class CurrentUpstreamAndPushRepoErrorTest(unittest.TestCase):
+    def setUp(self):
+        self._run = tray.subprocess.run
+
+    def tearDown(self):
+        tray.subprocess.run = self._run
+
+    def test_current_upstream_exception_returns_empty(self):
+        def raiser(*a, **k):
+            raise OSError("boom")
+        tray.subprocess.run = raiser
+        self.assertEqual(tray._current_upstream("/x", os.environ), "")
+
+    def test_push_repo_timeout(self):
+        def fake_run(argv, **kw):
+            if "rev-parse" in argv:
+                class R:
+                    returncode = 0
+                    stdout = "origin/main\n"
+                return R()
+            raise tray.subprocess.TimeoutExpired(cmd=argv, timeout=1)
+        tray.subprocess.run = fake_run
+        ok, msg = tray.push_repo("/x")
+        self.assertFalse(ok)
+        self.assertIn("timed out", msg)
+
+    def test_push_repo_oserror(self):
+        def fake_run(argv, **kw):
+            if "rev-parse" in argv:
+                class R:
+                    returncode = 0
+                    stdout = "origin/main\n"
+                return R()
+            raise OSError("boom")
+        tray.subprocess.run = fake_run
+        ok, msg = tray.push_repo("/x")
+        self.assertFalse(ok)
+        self.assertIn("boom", msg)
+
+
+class StreamArgvTest(unittest.TestCase):
+    def test_commit_stream_argv_flags(self):
+        argv = tray.commit_stream_argv("/bin/claude", 5.0)
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)
+        self.assertIn("--max-budget-usd", argv)
+
+    def test_commit_stream_argv_zero_budget_omits_flag(self):
+        argv = tray.commit_stream_argv("/bin/claude", 0)
+        self.assertNotIn("--max-budget-usd", argv)
+
+    def test_push_claude_stream_argv_flags(self):
+        argv = tray.push_claude_stream_argv("/bin/claude", 5.0,
+                                            model="opus", effort="high")
+        self.assertIn("stream-json", argv)
+        self.assertIn("--model", argv)
+        self.assertIn("opus", argv)
+        self.assertIn("--effort", argv)
+        self.assertIn("high", argv)
+
+
+class CommitRepoMoreTest(unittest.TestCase):
+    def setUp(self):
+        self._which = tray.shutil.which
+        self._run = tray.subprocess.run
+
+    def tearDown(self):
+        tray.shutil.which = self._which
+        tray.subprocess.run = self._run
+
+    def test_timeout(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        def raiser(*a, **k):
+            raise tray.subprocess.TimeoutExpired(cmd="claude", timeout=5)
+        tray.subprocess.run = raiser
+        ok, msg = tray.commit_repo("/x", timeout=5)
+        self.assertFalse(ok)
+        self.assertIn("timed out after 5s", msg)
+
+    def test_oserror(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        def raiser(*a, **k):
+            raise OSError("boom")
+        tray.subprocess.run = raiser
+        ok, msg = tray.commit_repo("/x")
+        self.assertFalse(ok)
+        self.assertIn("boom", msg)
+
+    def test_success_prefers_json_result(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        class R:
+            returncode = 0
+            stdout = '{"result": "committed 2 changes"}'
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        ok, msg = tray.commit_repo("/x")
+        self.assertTrue(ok)
+        self.assertEqual(msg, "committed 2 changes")
+
+    def test_nonzero_exit_falls_back_to_raw_output(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        class R:
+            returncode = 1
+            stdout = "not json"
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        ok, msg = tray.commit_repo("/x")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "not json")
+
+
+class PushClaudeRepoMoreTest(unittest.TestCase):
+    def setUp(self):
+        self._which = tray.shutil.which
+        self._run = tray.subprocess.run
+
+    def tearDown(self):
+        tray.shutil.which = self._which
+        tray.subprocess.run = self._run
+
+    def test_timeout(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        def raiser(*a, **k):
+            raise tray.subprocess.TimeoutExpired(cmd="claude", timeout=5)
+        tray.subprocess.run = raiser
+        ok, msg = tray.push_claude_repo("/x", timeout=5)
+        self.assertFalse(ok)
+        self.assertIn("timed out after 5s", msg)
+
+    def test_success_prefers_json_result(self):
+        tray.shutil.which = lambda _: "/usr/bin/claude"
+
+        class R:
+            returncode = 0
+            stdout = '{"result": "pushed"}'
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        ok, msg = tray.push_claude_repo("/x")
+        self.assertTrue(ok)
+        self.assertEqual(msg, "pushed")
+
+
+class FmtStreamEventTest(unittest.TestCase):
+    def test_non_json_passthrough(self):
+        self.assertEqual(tray._fmt_stream_event("plain text"), "plain text")
+
+    def test_assistant_text(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hello"}]}})
+        self.assertEqual(tray._fmt_stream_event(line), "hello\n")
+
+    def test_assistant_tool_use_command(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash",
+             "input": {"command": "ls -la"}}]}})
+        self.assertIn("► Bash: ls -la", tray._fmt_stream_event(line))
+
+    def test_assistant_tool_use_file_path(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit",
+             "input": {"file_path": "/x/y.py"}}]}})
+        self.assertIn("► Edit: /x/y.py", tray._fmt_stream_event(line))
+
+    def test_assistant_tool_use_other_keys(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Weird", "input": {"foo": "bar"}}]}})
+        self.assertIn("► Weird: foo=…", tray._fmt_stream_event(line))
+
+    def test_assistant_tool_use_non_dict_input(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Weird", "input": "raw"}]}})
+        self.assertIn("► Weird: raw", tray._fmt_stream_event(line))
+
+    def test_assistant_empty_content_returns_empty(self):
+        line = json.dumps({"type": "assistant", "message": {"content": []}})
+        self.assertEqual(tray._fmt_stream_event(line), "")
+
+    def test_result_error(self):
+        line = json.dumps({"type": "result", "is_error": True, "result": "boom"})
+        self.assertTrue(tray._fmt_stream_event(line).startswith("✗"))
+
+    def test_result_success(self):
+        line = json.dumps({"type": "result", "is_error": False, "result": "done"})
+        self.assertTrue(tray._fmt_stream_event(line).startswith("✓"))
+
+    def test_unknown_type_returns_empty(self):
+        self.assertEqual(tray._fmt_stream_event(json.dumps({"type": "system"})), "")
+
+
+class MemAvailableErrorTest(unittest.TestCase):
+    def test_missing_proc_meminfo_returns_zero(self):
+        import builtins
+        orig_open = builtins.open
+
+        def fake_open(path, *a, **k):
+            if path == "/proc/meminfo":
+                raise OSError("no such file")
+            return orig_open(path, *a, **k)
+
+        builtins.open = fake_open
+        try:
+            self.assertEqual(tray._mem_available_mb(), 0)
+        finally:
+            builtins.open = orig_open
+
+
+class FetchModelTest(unittest.TestCase):
+    def setUp(self):
+        self._core = tray._core_script
+        self._run = tray.subprocess.run
+
+    def tearDown(self):
+        tray._core_script = self._core
+        tray.subprocess.run = self._run
+
+    def test_core_script_path(self):
+        self.assertTrue(tray._core_script().endswith("repodash.py"))
+
+    def test_missing_core_script(self):
+        tray._core_script = lambda: "/no/such/repodash.py"
+        d = tray.fetch_model()
+        self.assertIn("error", d)
+        self.assertEqual(d["repos"], [])
+
+    def test_subprocess_error(self):
+        tray._core_script = lambda: __file__
+
+        def raiser(*a, **k):
+            raise OSError("boom")
+        tray.subprocess.run = raiser
+        d = tray.fetch_model()
+        self.assertIn("boom", d["error"])
+
+    def test_nonzero_exit(self):
+        tray._core_script = lambda: __file__
+
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "traceback here"
+        tray.subprocess.run = lambda *a, **k: R()
+        d = tray.fetch_model()
+        self.assertIn("traceback here", d["error"])
+
+    def test_bad_json(self):
+        tray._core_script = lambda: __file__
+
+        class R:
+            returncode = 0
+            stdout = "not json"
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        d = tray.fetch_model()
+        self.assertIn("bad JSON", d["error"])
+
+    def test_success(self):
+        tray._core_script = lambda: __file__
+
+        class R:
+            returncode = 0
+            stdout = '{"repos": [{"name": "x"}]}'
+            stderr = ""
+        tray.subprocess.run = lambda *a, **k: R()
+        d = tray.fetch_model()
+        self.assertEqual(d["repos"], [{"name": "x"}])
+
+
+class RunCheckTest(unittest.TestCase):
+    def setUp(self):
+        self._xdg = os.environ.get("XDG_CONFIG_HOME")
+        self._tmp = tempfile.mkdtemp(prefix="repodash-runcheck-")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp
+        self._scan_dirty = tray.scan_dirty
+        self._detect_terminal = tray.detect_terminal
+        self._resolve_base_dir = tray.resolve_base_dir
+
+    def tearDown(self):
+        tray.scan_dirty = self._scan_dirty
+        tray.detect_terminal = self._detect_terminal
+        tray.resolve_base_dir = self._resolve_base_dir
+        if self._xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._xdg
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_prints_all_sections(self):
+        tray.resolve_base_dir = lambda cfg: "/fake/base"
+        tray.detect_terminal = lambda: "ptyxis"
+        repos = [
+            {"path": "/repos/clean", "name": "clean", "branch": "main",
+             "ahead": 0, "behind": 0, "dirty": False, "count": 0,
+             "has_remote": True, "unpushed": 0,
+             "stale_worktrees": {"stuck": [], "idle": [], "merged": []}},
+            {"path": "/repos/dirty", "name": "dirty", "branch": "main",
+             "ahead": 1, "behind": 2, "dirty": True, "count": 3,
+             "has_remote": True, "unpushed": 4,
+             "stale_worktrees": {
+                 "stuck": [{"branch": "feat", "last_commit_age_hours": 20}],
+                 "idle": [{"branch": "old", "last_commit_age_hours": 30,
+                          "behind": 1}],
+                 "merged": [{"branch": "done", "last_commit_age_hours": 50}],
+             }},
+        ]
+        tray.scan_dirty = lambda base, depth, cfg: repos
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = tray.run_check()
+        out = buf.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("2 found, 1 dirty, 1 unpushed", out)
+        self.assertIn("stuck wt", out)
+        self.assertIn("idle wt", out)
+        self.assertIn("merged wt", out)
+        self.assertIn("unpushed  :", out)
+
+    def test_excluded_and_remoteless_filters_and_no_terminal(self):
+        tray.resolve_base_dir = lambda cfg: "/fake/base"
+        tray.detect_terminal = lambda: None
+        repos = [
+            {"path": "/repos/a", "name": "a", "branch": "main",
+             "ahead": 0, "behind": 0, "dirty": False, "count": 0,
+             "has_remote": False, "unpushed": 0},
+            {"path": "/repos/b", "name": "b", "branch": "main",
+             "ahead": 0, "behind": 0, "dirty": True, "count": 1,
+             "has_remote": True, "unpushed": 0},
+        ]
+        tray.scan_dirty = lambda base, depth, cfg: repos
+        cfg = tray.load_config()
+        cfg["excluded_repos"] = ["/repos/a"]
+        cfg["show_remoteless"] = False
+        tray.save_config(cfg)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tray.run_check()
+        out = buf.getvalue()
+        self.assertIn("1 found, 1 dirty", out)
+        self.assertIn("excluded  :", out)
+        self.assertIn("(none found", out)
 
 
 if __name__ == "__main__":

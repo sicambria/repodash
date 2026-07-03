@@ -31,6 +31,8 @@ PACKAGES=(
   gir1.2-ayatanaappindicator3-0.1
   libayatana-appindicator3-1
   gnome-shell-extension-appindicator
+  wl-clipboard
+  xclip
 )
 
 echo "==> Installing dependencies: ${PACKAGES[*]}"

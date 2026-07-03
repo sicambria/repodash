@@ -531,21 +531,37 @@ def open_folder(path: str):
     return _spawn(["xdg-open", path])
 
 
-def copy_to_clipboard(clipboard, text: str):
-    """Copy *text* to *clipboard* (a Gtk.Clipboard). Returns (ok, message), never raises.
+def clipboard_argv() -> list:
+    """argv for the system clipboard tool, chosen by session type."""
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return ["wl-copy"]
+    return ["xclip", "-selection", "clipboard"]
 
-    ``store()`` is what actually hands the content to the clipboard manager so
-    it survives after the owning app/menu loses focus; on some Wayland/XWayland
-    setups this (or set_text itself) can raise. Every other tray action reports
-    failures via notify() — this used to skip that, so a raised exception here
-    was swallowed by GTK's signal dispatch and printed to stderr, invisible to
-    the user, who just saw "Copy path" silently do nothing.
+
+def copy_to_clipboard(text: str):
+    """Copy *text* to the system clipboard. Returns (ok, message), never raises.
+
+    Shells out to wl-copy/xclip rather than using Gtk.Clipboard, matching how
+    open_folder/open_terminal already delegate to system tools. Gtk.Clipboard
+    needs the owning app to keep answering paste requests, which silently does
+    nothing when set from a tray/indicator menu item with no focused surface
+    (the classic Wayland/XWayland tray-clipboard failure) — set_text()/store()
+    return normally either way, so notify() alone can't catch it. A dedicated
+    clipboard tool forks and serves the selection independently of our GTK
+    event loop, and gives a real exit code to report through notify().
     """
+    argv = clipboard_argv()
+    tool = argv[0]
+    if not shutil.which(tool):
+        fallback = "xclip" if tool == "wl-copy" else "wl-copy"
+        return False, f"{tool} not found on PATH (install {tool}, or {fallback})"
     try:
-        clipboard.set_text(text, -1)
-        clipboard.store()
-    except Exception as e:
+        proc = subprocess.run(argv, input=text, text=True,
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
         return False, str(e)
+    if proc.returncode != 0:
+        return False, (proc.stderr or f"{tool} exited {proc.returncode}").strip()
     return True, ""
 
 
@@ -1007,7 +1023,7 @@ def run_gui() -> int:
                 "error: no AppIndicator typelib found. Install "
                 "gir1.2-ayatanaappindicator3-0.1 (see tray/README.md).\n")
             return 1
-    from gi.repository import Gtk, GLib, Gdk
+    from gi.repository import Gtk, GLib
     import threading
 
     APP_ID = "org.repodash.Tray"
@@ -1535,8 +1551,7 @@ def run_gui() -> int:
             return item
 
         def _copy(self, text):
-            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            notify(self.window, *copy_to_clipboard(clip, text))
+            notify(self.window, *copy_to_clipboard(text))
 
         # -- dashboard tier --
         def show_dashboard(self):

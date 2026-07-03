@@ -118,6 +118,11 @@ branch, change count, and GitHub URL.
 - **"no AppIndicator typelib found".** Install `gir1.2-ayatanaappindicator3-0.1`.
 - **A terminal action does nothing.** Set `REPODASH_TERMINAL` to a terminal you
   have installed, or install one of the auto-detected ones.
+- **"Copy path" reports \*-copy not found on PATH".** Install `wl-clipboard`
+  (Wayland) or `xclip` (X11) — `tray/setup.sh` installs both. Copy path shells
+  out to one of these rather than using GTK's own clipboard, because
+  `Gtk.Clipboard` silently no-ops when set from an unfocused tray-menu item on
+  Wayland/XWayland.
 
 ## License
 
