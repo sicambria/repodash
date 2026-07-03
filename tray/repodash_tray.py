@@ -115,6 +115,8 @@ CONFIG_DEFAULTS = {
     "commit_max_workers": 0,    # 0 = auto (RAM/CPU derived); >0 = hard cap
     "commit_timeout": 3600,     # seconds per repo (agentic runs are slow)
     "commit_budget_usd": 10.0,  # max $ a single repo's claude run may spend
+    "commit_model": "sonnet",   # claude --model for headless commit/push runs
+    "commit_effort": "medium",  # claude --effort for headless commit/push runs
     "stale_worktree_idle_hours": 24,
     "stale_worktree_stuck_hours": 12,
     "show_stale_worktrees": True,
@@ -529,6 +531,24 @@ def open_folder(path: str):
     return _spawn(["xdg-open", path])
 
 
+def copy_to_clipboard(clipboard, text: str):
+    """Copy *text* to *clipboard* (a Gtk.Clipboard). Returns (ok, message), never raises.
+
+    ``store()`` is what actually hands the content to the clipboard manager so
+    it survives after the owning app/menu loses focus; on some Wayland/XWayland
+    setups this (or set_text itself) can raise. Every other tray action reports
+    failures via notify() — this used to skip that, so a raised exception here
+    was swallowed by GTK's signal dispatch and printed to stderr, invisible to
+    the user, who just saw "Copy path" silently do nothing.
+    """
+    try:
+        clipboard.set_text(text, -1)
+        clipboard.store()
+    except Exception as e:
+        return False, str(e)
+    return True, ""
+
+
 def open_push(path: str):
     # Run `git push` in a terminal rather than silently in the background: a
     # push can prompt for credentials / an ssh passphrase and can fail, and the
@@ -621,33 +641,49 @@ def push_repo(path: str):
     return out.returncode == 0, (out.stdout + out.stderr).strip()
 
 
-def push_claude_argv(bin_path: str, budget_usd: float) -> list:
+def _model_effort_args(model: str, effort: str) -> list:
+    """--model/--effort flags for a headless claude invocation, if set."""
+    args = []
+    if model:
+        args += ["--model", model]
+    if effort:
+        args += ["--effort", effort]
+    return args
+
+
+def push_claude_argv(bin_path: str, budget_usd: float,
+                      model: str = "", effort: str = "") -> list:
     """argv to run claude headlessly with PUSH_PROMPT, bounded by a $ budget."""
     argv = [bin_path, "-p", PUSH_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format", "json"]
     if budget_usd and float(budget_usd) > 0:
         argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
     return argv
 
 
-def commit_stream_argv(bin_path: str, budget_usd: float) -> list:
+def commit_stream_argv(bin_path: str, budget_usd: float,
+                        model: str = "", effort: str = "") -> list:
     """argv for headless commit that streams live events (stream-json format)."""
     argv = [bin_path, "-p", COMMIT_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format", "stream-json", "--verbose"]
     if budget_usd and float(budget_usd) > 0:
         argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
     return argv
 
 
-def push_claude_stream_argv(bin_path: str, budget_usd: float) -> list:
+def push_claude_stream_argv(bin_path: str, budget_usd: float,
+                            model: str = "", effort: str = "") -> list:
     """argv for headless claude-push that streams live events."""
     argv = [bin_path, "-p", PUSH_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format", "stream-json", "--verbose"]
     if budget_usd and float(budget_usd) > 0:
         argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
     return argv
 
 
@@ -691,13 +727,14 @@ def _fmt_stream_event(line: str) -> str:
     return ""
 
 
-def push_claude_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
+def push_claude_repo(path: str, timeout: int = 900, budget_usd: float = 10.0,
+                      model: str = "", effort: str = ""):
     """Run claude in *path* to push via headless Claude. Returns (ok, output). Never raises."""
     bin_path = shutil.which(CLAUDE_BIN)
     if not bin_path:
         return False, "claude not found on PATH"
     try:
-        out = subprocess.run(push_claude_argv(bin_path, budget_usd), cwd=path,
+        out = subprocess.run(push_claude_argv(bin_path, budget_usd, model, effort), cwd=path,
                              stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -743,17 +780,20 @@ def commit_workers(ram_mb: int, cap: int) -> int:
     return max(1, n)
 
 
-def commit_argv(bin_path: str, budget_usd: float) -> list:
+def commit_argv(bin_path: str, budget_usd: float,
+                 model: str = "", effort: str = "") -> list:
     """argv to run claude headlessly with COMMIT_PROMPT, bounded by a $ budget."""
     argv = [bin_path, "-p", COMMIT_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format", "json"]
     if budget_usd and float(budget_usd) > 0:
         argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
     return argv
 
 
-def commit_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
+def commit_repo(path: str, timeout: int = 900, budget_usd: float = 10.0,
+                 model: str = "", effort: str = ""):
     """Run claude in *path* to commit (and maybe merge). Returns ``(ok, output)``.
 
     Never raises. ``ok`` is True only on a clean exit; a non-zero exit (error or
@@ -766,7 +806,7 @@ def commit_repo(path: str, timeout: int = 900, budget_usd: float = 10.0):
     if not bin_path:
         return False, "claude not found on PATH"
     try:
-        out = subprocess.run(commit_argv(bin_path, budget_usd), cwd=path,
+        out = subprocess.run(commit_argv(bin_path, budget_usd, model, effort), cwd=path,
                              stdin=subprocess.DEVNULL,
                              capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -901,7 +941,9 @@ def run_check() -> int:
     print(f"commit    : {ram_mb} MB/proc, {cap_desc} → {workers} workers, "
           f"{cfg.get('commit_timeout', 3600)}s timeout, "
           f"${cfg.get('commit_budget_usd', 10.0)}/repo  [{avail_desc}]")
-    print(f"  claude   : {claude_bin}")
+    print(f"  claude   : {claude_bin}  "
+          f"(model {cfg.get('commit_model', 'sonnet')}, "
+          f"effort {cfg.get('commit_effort', 'medium')})")
 
     repos = scan_dirty(base, depth, cfg)
     repos = [r for r in repos if r["path"] not in excluded]
@@ -1228,7 +1270,9 @@ def run_gui() -> int:
                                                 cfg.get("commit_ram_mb", 2048),
                                                 cfg.get("commit_max_workers", 0),
                                                 cfg.get("commit_timeout", 3600),
-                                                cfg.get("commit_budget_usd", 10.0)))
+                                                cfg.get("commit_budget_usd", 10.0),
+                                                cfg.get("commit_model", "sonnet"),
+                                                cfg.get("commit_effort", "medium")))
 
         def _on_commit_repo(self, r):
             if self._op_running:
@@ -1242,7 +1286,9 @@ def run_gui() -> int:
                                                 cfg.get("commit_ram_mb", 2048),
                                                 cfg.get("commit_max_workers", 0),
                                                 cfg.get("commit_timeout", 3600),
-                                                cfg.get("commit_budget_usd", 10.0)))
+                                                cfg.get("commit_budget_usd", 10.0),
+                                                cfg.get("commit_model", "sonnet"),
+                                                cfg.get("commit_effort", "medium")))
 
         def _on_push_claude_repo(self, r):
             if self._op_running:
@@ -1255,6 +1301,8 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
+                cfg.get("commit_model", "sonnet"),
+                cfg.get("commit_effort", "medium"),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
                 argv_fn=push_claude_stream_argv))
@@ -1274,6 +1322,8 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
+                cfg.get("commit_model", "sonnet"),
+                cfg.get("commit_effort", "medium"),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
                 argv_fn=push_claude_stream_argv))
@@ -1295,6 +1345,8 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
+                cfg.get("commit_model", "sonnet"),
+                cfg.get("commit_effort", "medium"),
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
                 row_suffix=lambda rr: rr.get("branch", ""),
                 argv_fn=push_claude_stream_argv))
@@ -1484,8 +1536,7 @@ def run_gui() -> int:
 
         def _copy(self, text):
             clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-            clip.set_text(text, -1)
-            clip.store()
+            notify(self.window, *copy_to_clipboard(clip, text))
 
         # -- dashboard tier --
         def show_dashboard(self):
@@ -1905,7 +1956,7 @@ def run_gui() -> int:
         (with a confirmation prompt) using process-group kill so no orphaned
         children are left behind.
 
-        ``argv_fn(bin_path, budget_usd) → list`` selects the claude invocation.
+        ``argv_fn(bin_path, budget_usd, model, effort) → list`` selects the claude invocation.
         Defaults to ``commit_stream_argv``; pass ``push_claude_stream_argv`` for
         push-via-claude operations.
         """
@@ -1913,6 +1964,7 @@ def run_gui() -> int:
         PENDING, RUNNING, OK, FAIL, STOPPED = "·", "↻", "✓", "✗", "⊘"
 
         def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd,
+                     model="", effort="",
                      verb="Commit", verb_ing="Committing", verb_past="Committed",
                      worker=None, row_suffix=None, argv_fn=None):
             title = f"{verb} {repos[0]['name']}" if len(repos) == 1 else f"{verb} all"
@@ -1920,6 +1972,8 @@ def run_gui() -> int:
             self._repos = repos
             self._timeout = timeout
             self._budget = budget_usd
+            self._model = model
+            self._effort = effort
             self._verb_past = verb_past
             self._argv_fn = argv_fn if argv_fn is not None else commit_stream_argv
             self._row_suffix = row_suffix
@@ -2046,7 +2100,7 @@ def run_gui() -> int:
                                   f"[{r['name']}] claude not found on PATH\n")
                     return r, False
 
-                argv = self._argv_fn(bin_path, self._budget)
+                argv = self._argv_fn(bin_path, self._budget, self._model, self._effort)
                 GLib.idle_add(self._append_log, f"=== {r['name']} ===\n")
 
                 try:
@@ -2359,6 +2413,24 @@ def run_gui() -> int:
                 vbox.pack_start(hbox, False, False, 0)
                 return spin
 
+            def combo_row(label_text, key, options, default, hint=None):
+                hbox = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
+                hbox.pack_start(lbl, False, False, 0)
+                combo = Gtk.ComboBoxText()
+                for opt_id, opt_label in options:
+                    combo.append(opt_id, opt_label)
+                current = self._config.get(key, default)
+                if combo.set_active_id(current) is False:
+                    combo.set_active_id(default)
+                hbox.pack_start(combo, False, False, 0)
+                if hint:
+                    hl = Gtk.Label(label=hint, xalign=0.0)
+                    hl.get_style_context().add_class("dim-label")
+                    hbox.pack_start(hl, False, False, 0)
+                vbox.pack_start(hbox, False, False, 0)
+                return combo
+
             def prompt_row(label_text, key, default_text):
                 lbl = Gtk.Label(label=label_text, xalign=0.0)
                 vbox.pack_start(lbl, False, False, 0)
@@ -2388,6 +2460,14 @@ def run_gui() -> int:
             self._spin_commit_budget = spin_row(
                 "Budget ($/repo):", "commit_budget_usd", 10.0, 0, 1000, 1,
                 digits=2, hint="max claude spend per repo (0 = unbounded)")
+            self._combo_commit_model = combo_row(
+                "Model:", "commit_model",
+                [("sonnet", "Sonnet 5"), ("opus", "Opus")], "sonnet",
+                hint="model for headless commit/push runs")
+            self._combo_commit_effort = combo_row(
+                "Effort:", "commit_effort",
+                [("medium", "Medium"), ("high", "High")], "medium",
+                hint="reasoning effort for headless commit/push runs")
 
             # ── Prompts ────────────────────────────────────────────────────
             section("⏸  Idle worktree — close prompt")
@@ -2425,6 +2505,10 @@ def run_gui() -> int:
             cfg["commit_timeout"] = int(self._spin_commit_timeout.get_value())
             cfg["commit_budget_usd"] = round(
                 self._spin_commit_budget.get_value(), 2)
+            cfg["commit_model"] = (
+                self._combo_commit_model.get_active_id() or "sonnet")
+            cfg["commit_effort"] = (
+                self._combo_commit_effort.get_active_id() or "medium")
             cfg["show_stale_worktrees"] = self._chk_show_stale.get_active()
             cfg["stale_worktree_idle_hours"] = int(self._spin_idle_hours.get_value())
             cfg["stale_worktree_stuck_hours"] = int(self._spin_stuck_hours.get_value())
@@ -2502,7 +2586,8 @@ def run_gui() -> int:
             ("item", "Repositories",
              "Per-repo include/exclude list. Rescan after changing the root."),
             ("item", "Claude Code",
-             "RAM/worker/timeout/budget limits for headless Claude runs; "
+             "RAM/worker/timeout/budget limits, model (Sonnet 5 / Opus) and "
+             "effort (Medium / High) for headless Claude commit/push runs; "
              "customisable prompts for worktree close and finish actions. "
              "Placeholders {path}, {branch}, {repo_path} are substituted at "
              "runtime."),

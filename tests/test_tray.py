@@ -166,6 +166,61 @@ class PushActionTest(unittest.TestCase):
                 os.environ["REPODASH_TERMINAL"] = saved
 
 
+class CopyToClipboardTest(unittest.TestCase):
+    """copy_to_clipboard() takes a Gtk.Clipboard-shaped object, so a plain stub
+    exercises it without needing GTK. RCA (2026-07-03): 'Copy path' was the one
+    tray action that never called notify(), so a raised exception (clipboard
+    manager errors happen on some Wayland/XWayland setups) was swallowed by
+    GTK's signal dispatch and printed to stderr — invisible to the user, who
+    just saw the action silently do nothing.
+    """
+
+    class _OkClipboard:
+        def __init__(self):
+            self.text = None
+            self.stored = False
+
+        def set_text(self, text, length):
+            self.text = text
+
+        def store(self):
+            self.stored = True
+
+    class _RaisingClipboard:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def set_text(self, text, length):
+            raise self._exc
+
+        def store(self):
+            pass
+
+    def test_success_sets_and_stores_text(self):
+        clip = self._OkClipboard()
+        ok, msg = tray.copy_to_clipboard(clip, "/home/user/repo")
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+        self.assertEqual(clip.text, "/home/user/repo")
+        self.assertTrue(clip.stored)
+
+    def test_exception_is_caught_and_reported(self):
+        clip = self._RaisingClipboard(RuntimeError("no clipboard manager"))
+        ok, msg = tray.copy_to_clipboard(clip, "/home/user/repo")
+        self.assertFalse(ok)
+        self.assertIn("no clipboard manager", msg)
+
+    def test_store_exception_is_also_caught(self):
+        class _StoreRaises(CopyToClipboardTest._OkClipboard):
+            def store(self):
+                raise RuntimeError("store failed")
+
+        clip = _StoreRaises()
+        ok, msg = tray.copy_to_clipboard(clip, "/x")
+        self.assertFalse(ok)
+        self.assertIn("store failed", msg)
+
+
 class AutostartTest(unittest.TestCase):
     def setUp(self):
         self._home = os.environ.get("HOME")
@@ -528,6 +583,18 @@ class CommitArgvTest(unittest.TestCase):
         argv = tray.commit_argv("/x/claude", 0)
         self.assertNotIn("--max-budget-usd", argv)
 
+    def test_model_and_effort_flags(self):
+        argv = tray.commit_argv("/x/claude", 10.0, "opus", "high")
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    def test_empty_model_and_effort_omit_flags(self):
+        argv = tray.commit_argv("/x/claude", 10.0, "", "")
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--effort", argv)
+
 
 class CommitRepoTest(unittest.TestCase):
     def test_missing_claude_reports_clearly(self):
@@ -612,6 +679,13 @@ class PushClaudeArgvTest(unittest.TestCase):
     def test_zero_budget_omits_flag(self):
         argv = tray.push_claude_argv("/x/claude", 0)
         self.assertNotIn("--max-budget-usd", argv)
+
+    def test_model_and_effort_flags(self):
+        argv = tray.push_claude_argv("/x/claude", 10.0, "opus", "high")
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
 
     def test_prompt_differs_from_commit_prompt(self):
         self.assertNotEqual(tray.PUSH_PROMPT, tray.COMMIT_PROMPT)
