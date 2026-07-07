@@ -1684,14 +1684,14 @@ class ProviderRegistryTest(unittest.TestCase):
     def test_opencode_build_argv_omits_budget_and_effort(self):
         argv = tray.PROVIDERS["opencode"].build_argv(
             "/x/opencode", "commit", "stream-json", 10.0,
-            "anthropic/claude-sonnet-5", "high")
+            "opencode/deepseek-v4-flash-free", "high")
         self.assertEqual(argv[0], "/x/opencode")
         self.assertIn("run", argv)
         self.assertIn("--auto", argv)
         self.assertNotIn("--max-budget-usd", argv)
         self.assertIn("--model", argv)
         self.assertEqual(argv[argv.index("--model") + 1],
-                         "anthropic/claude-sonnet-5")
+                         "opencode/deepseek-v4-flash-free")
         self.assertNotIn("--effort", argv)
 
     def test_opencode_build_argv_omits_model_flag_when_empty(self):
