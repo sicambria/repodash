@@ -656,6 +656,8 @@ def clipboard_argv() -> list:
     """argv for the system clipboard tool, chosen by session type / platform."""
     if sys.platform == "win32":
         return ["clip"]
+    if sys.platform == "darwin":
+        return ["pbcopy"]
     if os.environ.get("WAYLAND_DISPLAY"):
         return ["wl-copy"]
     return ["xclip", "-selection", "clipboard"]
@@ -676,8 +678,9 @@ def copy_to_clipboard(text: str):
     argv = clipboard_argv()
     tool = argv[0]
     if not shutil.which(tool):
-        fallback = "xclip" if tool == "wl-copy" else "wl-copy"
-        return False, f"{tool} not found on PATH (install {tool}, or {fallback})"
+        platform_tools = {"win32": "clip", "darwin": "pbcopy"}
+        plat_tool = platform_tools.get(sys.platform, tool)
+        return False, f"{tool} not found on PATH (install {plat_tool})"
     try:
         proc = subprocess.run(argv, input=text, text=True,
                               capture_output=True, timeout=5)

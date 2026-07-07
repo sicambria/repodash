@@ -160,19 +160,15 @@ def run_gui_win() -> int:
 
     REFRESH_INTERVAL_MS = 90_000
 
-    def _load_icon(icon_path=None):
-        if icon_path and os.path.isfile(icon_path):
-            return _user32.LoadImageW(None, icon_path, IMAGE_ICON, 0, 0,
-                                      LR_LOADFROMFILE)
-        return _user32.LoadIconW(None, IDI_APPLICATION)
-
-    def _icon_path():
+    def _load_icon():
         ico = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "repodash.ico")
         if os.path.isfile(ico):
-            return ico
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "repodash.svg")
+            hicon = _user32.LoadImageW(None, ico, IMAGE_ICON, 0, 0,
+                                       LR_LOADFROMFILE)
+            if hicon:
+                return hicon
+        return _user32.LoadIconW(None, IDI_APPLICATION)
 
     # ── Win32 message pump thread ─────────────────────────────────────────
     def _win32_pump(root, msg_queue):
@@ -189,8 +185,9 @@ def run_gui_win() -> int:
                     msg_queue.put((msg.message, msg.wParam, msg.lParam))
                 _user32.TranslateMessage(_ct.byref(msg))
                 _user32.DispatchMessageW(_ct.byref(msg))
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
     # ── WinTrayIcon ───────────────────────────────────────────────────────
     class WinTrayIcon:
@@ -199,11 +196,12 @@ def run_gui_win() -> int:
             self.config = config
             self.repos = []
             self.hwnd = int(root.frame(), 16)
-            self.hicon = _load_icon(_icon_path())
+            self.hicon = _load_icon()
             self.nid = NOTIFYICONDATAW()
             self._timer_id = None
             self._op_running = False
             self._menu_handles = []
+            self._menu_callbacks = {}
             self._msg_queue = queue.Queue()
 
             self._add_icon()
@@ -243,8 +241,6 @@ def run_gui_win() -> int:
             self._timer_id = self.root.after(delay, self._start_refresh)
 
         def refresh_menu(self):
-            if self._timer_id and self._op_running:
-                return
             def work():
                 base = resolve_base_dir(self.config)
                 depth = resolve_depth(self.config)
@@ -297,6 +293,9 @@ def run_gui_win() -> int:
                 menu, TPM_RIGHTBUTTON | TPM_LEFTBUTTON,
                 pos.x, pos.y, 0, self.hwnd, None)
             _user32.PostMessageW(self.hwnd, 0, 0, 0)
+            for h in reversed(self._menu_handles):
+                _user32.DestroyMenu(h)
+            self._menu_handles = []
             if cmd:
                 self._handle_menu_command(cmd)
 
@@ -306,11 +305,10 @@ def run_gui_win() -> int:
                         if r["has_remote"] and r.get("unpushed", 0) > 0]
             stale_worktrees = []
             for r in self.repos:
-                for wt_list_key in ("stuck_worktrees", "idle_worktrees",
-                                    "merged_worktrees"):
-                    for wt in r.get(wt_list_key, []):
+                for severity, wts in r.get("stale_worktrees", {}).items():
+                    for wt in wts:
                         wt["_repo"] = r
-                        wt["_severity"] = wt_list_key.split("_")[0]
+                        wt["_severity"] = severity
                         stale_worktrees.append(wt)
 
             cmd_id = 1000
@@ -369,11 +367,10 @@ def run_gui_win() -> int:
         def _action(self, menu, text, cmd_id, callback=None):
             _user32.AppendMenuW(menu, MF_STRING, cmd_id, text)
             if callback:
-                self._menu_callbacks = getattr(self, "_menu_callbacks", {})
                 self._menu_callbacks[cmd_id] = callback
 
         def _handle_menu_command(self, cmd_id):
-            callbacks = getattr(self, "_menu_callbacks", {})
+            callbacks = self._menu_callbacks
             if cmd_id in callbacks:
                 callbacks[cmd_id]()
                 return
@@ -393,8 +390,11 @@ def run_gui_win() -> int:
         def _on_wt_remove(self, wt):
             ok, msg = remove_worktree(wt["_repo"]["path"], wt["path"],
                                       wt.get("branch", ""))
-            if not ok and msg:
-                messagebox.showwarning("Remove worktree", msg, parent=self.root)
+            if not ok:
+                messagebox.showwarning(
+                    "Remove worktree",
+                    msg or "failed to remove worktree (no output)",
+                    parent=self.root)
             self.refresh_menu()
 
         def show_dashboard(self):
@@ -484,21 +484,26 @@ def run_gui_win() -> int:
             self.reload()
 
         def reload(self):
+            if hasattr(self, "_loading") and self._loading:
+                return
+            self._loading = True
             def work():
                 model = fetch_model()
-                self.tray.root.after(0, lambda: self._populate(model))
+                repos = model.get("repos", [])
+                if not model.get("error"):
+                    excluded = set(self.config.get("excluded_repos", []))
+                    repos = [r for r in repos if r.get("path") not in excluded]
+                    for r in repos:
+                        r["github"] = github_url(r.get("path", ""))
+                self.tray.root.after(0, lambda: self._populate(model, repos))
             threading.Thread(target=work, daemon=True).start()
 
-        def _populate(self, model):
+        def _populate(self, model, repos):
+            self._loading = False
             self._tree.delete(*self._tree.get_children())
-            repos = model.get("repos", [])
             if model.get("error"):
                 self._tree.insert("", tk.END, values=(f"Error: {model['error']}", "", ""))
                 return
-            excluded = set(self.config.get("excluded_repos", []))
-            repos = [r for r in repos if r.get("path") not in excluded]
-            for r in repos:
-                r["github"] = github_url(r.get("path", ""))
             self._repos = repos
             self._filter()
 
