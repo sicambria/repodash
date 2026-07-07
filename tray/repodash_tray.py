@@ -773,7 +773,7 @@ def push_claude_stream_argv(bin_path: str, budget_usd: float,
 
 def explain_stream_argv(bin_path: str, budget_usd: float,
                         model: str = "", effort: str = "") -> list:
-    """argv for headless claude-explain (read-only) that streams live events."""
+    """argv for headless explain (read-only) that streams live events."""
     argv = [bin_path, "-p", EXPLAIN_PROMPT,
             "--dangerously-skip-permissions",
             "--output-format", "stream-json", "--verbose"]
@@ -815,7 +815,7 @@ def explain_actions(r: dict) -> list:
 
 
 def _fmt_stream_event(line: str) -> str:
-    """Parse one stream-json line from claude into human-readable text.
+    """Parse one stream-json line from an AI provider into human-readable text.
 
     Returns "" for events that should be silently skipped.
     """
@@ -1036,9 +1036,10 @@ def _extract_result_claude(line: str):
 
 
 def _extract_result_generic(line: str):
-    """Best-effort 'final answer' field lookup for providers whose JSON event
-    schema isn't confirmed. Returns None if the line isn't a JSON object or
-    has no recognizable result-ish field."""
+    """Best-effort 'final answer' field lookup for any AI provider. Returns
+    None if the line isn't a JSON object or has no recognizable result-ish
+    field. Providers route to their own extract_result via PROVIDERS, so a
+    non-Claude primary uses this function automatically."""
     import json as _json
     try:
         d = _json.loads(line)
@@ -1046,10 +1047,34 @@ def _extract_result_generic(line: str):
         return None
     if not isinstance(d, dict):
         return None
-    for key in ("result", "text", "message"):
+    # Providers that use a Claude-like stream-json schema ("type":"result").
+    if d.get("type") == "result":
+        return str(d.get("result", "")).strip()
+    # Flat result fields (text, message, result, response, output, answer).
+    for key in ("result", "text", "message", "response", "output", "answer"):
         val = d.get(key)
-        if val:
-            return str(val).strip()
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    # OpenAI / Anthropic / Gemini content arrays: {"content":[{"type":"text","text":"..."}]}
+    content = d.get("content")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if parts:
+            return "\n".join(parts).strip()
+    # {"message":{"content":[{"type":"text","text":"..."}]}} (OpenAI response wrapper)
+    msg = d.get("message")
+    if isinstance(msg, dict):
+        msg_content = msg.get("content")
+        if isinstance(msg_content, list):
+            parts = []
+            for item in msg_content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            if parts:
+                return "\n".join(parts).strip()
     return None
 
 
@@ -1060,11 +1085,20 @@ def _fmt_stream_event_generic(line: str) -> str:
     plain log lines, never break the run."""
     import json as _json
     try:
-        _json.loads(line)
+        d = _json.loads(line)
     except (ValueError, TypeError):
         return line  # pass non-JSON through verbatim
+    if not isinstance(d, dict):
+        return line
     result = _extract_result_generic(line)
-    return f"{result}\n" if result else ""
+    if result:
+        return f"{result}\n"
+    # For JSON objects with no result field, show the object as compact JSON
+    # so the user can always see what the provider emitted.
+    try:
+        return _json.dumps(d, ensure_ascii=False) + "\n"
+    except (ValueError, TypeError):
+        return line
 
 
 def _claude_worktree_cmd(bin_path: str, prompt_text: str) -> str:
@@ -2892,8 +2926,9 @@ def run_gui() -> int:
             self._main_view.set_wrap_mode(Gtk.WrapMode.WORD)
             self._main_view.set_left_margin(4)
             self._main_view.set_right_margin(4)
+            primary_label = PROVIDERS[self._provider_sel["primary"]].label
             self._main_view.get_buffer().set_text(
-                "Asking Claude Code to explain changes…")
+                f"Asking {primary_label} to explain changes…")
             main_scroll = Gtk.ScrolledWindow()
             main_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
                                    Gtk.PolicyType.AUTOMATIC)
@@ -2931,7 +2966,7 @@ def run_gui() -> int:
                 buttons=Gtk.ButtonsType.YES_NO,
                 text="Stop explaining?")
             dlg.format_secondary_text(
-                "The running claude process will be killed.")
+                "The running AI process will be killed.")
             resp = dlg.run()
             dlg.destroy()
             if resp != Gtk.ResponseType.YES:
@@ -3056,8 +3091,10 @@ def run_gui() -> int:
                         result_text = text
                     # Read-only, so — unlike commit/push — fall back on any
                     # failure with no _repo_op_gate check: there is nothing a
-                    # second attempt could double-do.
-                    if ok or self._cancel.is_set():
+                    # second attempt could double-do. Also fall back when the
+                    # provider ran successfully but produced no extractable
+                    # explanation (only stop when we have the answer).
+                    if (ok and result_text) or self._cancel.is_set():
                         break
 
                 if self._cancel.is_set() and not result_text:

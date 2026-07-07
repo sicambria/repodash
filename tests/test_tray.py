@@ -1740,15 +1740,55 @@ class ProviderRegistryTest(unittest.TestCase):
         line = json.dumps({"result": "did the thing"})
         self.assertEqual(tray._fmt_stream_event_generic(line), "did the thing\n")
 
-    def test_fmt_stream_event_generic_skips_unrecognized_json(self):
+    def test_fmt_stream_event_generic_shows_unrecognized_json_as_compact(self):
         line = json.dumps({"type": "system", "foo": "bar"})
-        self.assertEqual(tray._fmt_stream_event_generic(line), "")
+        out = tray._fmt_stream_event_generic(line)
+        self.assertIsNot(out, "")
+        self.assertEqual(json.loads(out.rstrip()),
+                         json.loads(line))
 
     def test_extract_result_generic_checks_result_text_message(self):
         self.assertEqual(
             tray._extract_result_generic(json.dumps({"text": "hi"})), "hi")
         self.assertIsNone(tray._extract_result_generic("not json"))
         self.assertIsNone(tray._extract_result_generic(json.dumps([1, 2, 3])))
+
+    def test_extract_result_generic_handles_type_result(self):
+        self.assertEqual(
+            tray._extract_result_generic(
+                json.dumps({"type": "result", "result": "done"})),
+            "done")
+
+    def test_extract_result_generic_handles_extra_keys(self):
+        self.assertEqual(
+            tray._extract_result_generic(
+                json.dumps({"response": "answer"})), "answer")
+        self.assertEqual(
+            tray._extract_result_generic(
+                json.dumps({"output": "out"})), "out")
+        self.assertEqual(
+            tray._extract_result_generic(
+                json.dumps({"answer": "yes"})), "yes")
+
+    def test_extract_result_generic_handles_content_arrays(self):
+        self.assertEqual(
+            tray._extract_result_generic(json.dumps(
+                {"content": [{"type": "text", "text": "line 1"},
+                             {"type": "text", "text": "line 2"}]})),
+            "line 1\nline 2")
+
+    def test_extract_result_generic_handles_message_wrapper(self):
+        self.assertEqual(
+            tray._extract_result_generic(json.dumps(
+                {"message": {"content": [
+                    {"type": "text", "text": "the explanation"}]}})),
+            "the explanation")
+
+    def test_extract_result_generic_ignores_empty_strings(self):
+        self.assertIsNone(tray._extract_result_generic(
+            json.dumps({"text": "   "})))
+        self.assertIsNone(tray._extract_result_generic(
+            json.dumps({"result": ""})))
 
 
 class ProviderSelectionTest(unittest.TestCase):
