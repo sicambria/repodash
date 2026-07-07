@@ -1642,25 +1642,53 @@ def run_gui() -> int:
             if ok != item.get_active():
                 item.set_active(ok)
 
+        def _show_error(self, title, detail):
+            """Surface a dialog-construction failure (does not use a
+            potentially-broken ConfigDialog).  Returns False if even the
+            error dialog could not be shown (bare terminal fallback)."""
+            try:
+                parent = self.window if (self.window and self.window.get_visible()) else None
+                dlg = Gtk.MessageDialog(transient_for=parent, modal=True,
+                                        message_type=Gtk.MessageType.ERROR,
+                                        buttons=Gtk.ButtonsType.OK,
+                                        text=title)
+                dlg.format_secondary_text(detail)
+                dlg.run()
+                dlg.destroy()
+                return True
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                return False
+
         def _on_settings(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = ConfigDialog(parent, self.config)
-            response = dlg.run()
-            if response == Gtk.ResponseType.OK:
-                self.config = dlg.get_config()
-                apply_config_to_env(self.config)
-                save_config(self.config)
-                # Re-arm the refresh timer with the (possibly new) interval.
-                if self._timer_id:
-                    GLib.source_remove(self._timer_id)
-                self._timer_id = GLib.timeout_add_seconds(
-                    resolve_interval(self.config), self._on_timer)
-                self.refresh_menu()
-                if self.window is not None:
-                    self.window.set_config(self.config)
-                    if self.window.get_visible():
-                        self.window.reload()
-            dlg.destroy()
+            try:
+                dlg = ConfigDialog(parent, self.config)
+                response = dlg.run()
+                if response == Gtk.ResponseType.OK:
+                    self.config = dlg.get_config()
+                    apply_config_to_env(self.config)
+                    save_config(self.config)
+                    if self._timer_id:
+                        GLib.source_remove(self._timer_id)
+                    self._timer_id = GLib.timeout_add_seconds(
+                        resolve_interval(self.config), self._on_timer)
+                    self.refresh_menu()
+                    if self.window is not None:
+                        self.window.set_config(self.config)
+                        if self.window.get_visible():
+                            self.window.reload()
+                dlg.destroy()
+            except Exception:
+                import traceback
+                msg = traceback.format_exc()
+                traceback.print_exc()
+                self._show_error(
+                    "Settings could not be opened",
+                    "A bug in the settings dialog construction prevented it "
+                    "from being shown. The error has been printed to the "
+                    "terminal.\n\n" + msg.split("\n")[-2])
 
         def _run_op_dialog(self, dlg):
             """Run a commit/push dialog, blocking concurrent ops."""
@@ -1806,35 +1834,53 @@ def run_gui() -> int:
 
         def _on_help(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = HelpDialog(parent)
-            dlg.run()
-            dlg.destroy()
+            try:
+                dlg = HelpDialog(parent)
+                dlg.run()
+                dlg.destroy()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                self._show_error(
+                    "Help could not be opened",
+                    "A bug in the help dialog construction prevented it "
+                    "from being shown. The error has been printed to the "
+                    "terminal.")
 
         def _on_about(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
-            dlg = Gtk.AboutDialog(transient_for=parent, modal=True)
-            dlg.set_program_name("repodash")
-            dlg.set_version(VERSION)
-            dlg.set_comments(
-                "A tray companion for your git repositories.\n"
-                "Monitors dirty repos, unpushed commits, and stale\n"
-                "worktrees — and launches AI CLI actions (Claude Code,\n"
-                "OpenCode, Codex) from the menu."
-            )
-            dlg.set_copyright("© 2026 repodash contributors")
-            dlg.set_license_type(Gtk.License.GPL_3_0)
-            dlg.set_authors(["repodash contributors"])
-            dlg.set_website("https://github.com/sicambria/repodash")
-            dlg.set_website_label("github.com/sicambria/repodash")
-            if os.path.isfile(ICON_SVG):
-                try:
-                    from gi.repository import GdkPixbuf
-                    pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_SVG, 64, 64)
-                    dlg.set_logo(pb)
-                except Exception:
-                    pass
-            dlg.run()
-            dlg.destroy()
+            try:
+                dlg = Gtk.AboutDialog(transient_for=parent, modal=True)
+                dlg.set_program_name("repodash")
+                dlg.set_version(VERSION)
+                dlg.set_comments(
+                    "A tray companion for your git repositories.\n"
+                    "Monitors dirty repos, unpushed commits, and stale\n"
+                    "worktrees — and launches AI CLI actions (Claude Code,\n"
+                    "OpenCode, Codex) from the menu."
+                )
+                dlg.set_copyright("© 2026 repodash contributors")
+                dlg.set_license_type(Gtk.License.GPL_3_0)
+                dlg.set_authors(["repodash contributors"])
+                dlg.set_website("https://github.com/sicambria/repodash")
+                dlg.set_website_label("github.com/sicambria/repodash")
+                if os.path.isfile(ICON_SVG):
+                    try:
+                        from gi.repository import GdkPixbuf
+                        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_SVG, 64, 64)
+                        dlg.set_logo(pb)
+                    except Exception:
+                        pass
+                dlg.run()
+                dlg.destroy()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                self._show_error(
+                    "About could not be opened",
+                    "A bug in the about dialog construction prevented it "
+                    "from being shown. The error has been printed to the "
+                    "terminal.")
 
         def _ai_label(self):
             pid = self.config.get("ai_primary_provider", "claude")
@@ -2005,11 +2051,20 @@ def run_gui() -> int:
 
         # -- dashboard tier --
         def show_dashboard(self):
-            if self.window is None:
-                self.window = DashboardWindow(self, self.config)
-            self.window.show_all()  # show the window chrome + containers
-            self.window.present()
-            self.window.reload()
+            try:
+                if self.window is None:
+                    self.window = DashboardWindow(self, self.config)
+                self.window.show_all()
+                self.window.present()
+                self.window.reload()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                self._show_error(
+                    "Dashboard could not be opened",
+                    "A bug in the dashboard window construction prevented it "
+                    "from being shown. The error has been printed to the "
+                    "terminal.")
 
     class DashboardWindow(Gtk.Window):
         def __init__(self, app, config):
