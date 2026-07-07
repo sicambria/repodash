@@ -1151,9 +1151,14 @@ HEADLESS_PROVIDER_IDS = [pid for pid, p in PROVIDERS.items() if p.headless]
 
 def _fetch_opencode_go_models():
     global _FETCHED_OPENGODE_GO_MODELS
+    bin_path = resolve_tool_bin("opencode")
+    if not bin_path:
+        print("[repodash] opencode binary not found on PATH", file=sys.stderr)
+        _FETCHED_OPENGODE_GO_MODELS = []
+        return
     try:
         result = subprocess.run(
-            ["opencode", "models", "opencode-go"],
+            [bin_path, "models", "opencode-go"],
             capture_output=True, text=True, timeout=_OPENGODE_GO_FETCH_TIMEOUT,
         )
         if result.returncode != 0:
@@ -1165,8 +1170,8 @@ def _fetch_opencode_go_models():
         models = [line.strip() for line in result.stdout.splitlines()
                   if line.strip()]
         _FETCHED_OPENGODE_GO_MODELS = [(m, m) for m in models]
-        print("[repodash] fetched %d models from opencode-go" % len(models),
-              file=sys.stderr)
+        print("[repodash] fetched %d models from opencode-go (via %s)" %
+              (len(models), bin_path), file=sys.stderr)
     except FileNotFoundError:
         print("[repodash] opencode binary not found on PATH", file=sys.stderr)
         _FETCHED_OPENGODE_GO_MODELS = []
@@ -3380,6 +3385,8 @@ def run_gui() -> int:
             closed set (e.g. Claude Code can point at a DeepSeek/GLM endpoint
             via ANTHROPIC_BASE_URL — any model string the provider accepts
             is valid here)."""
+            print("[repodash] _build_ai_provider_tab pid=%s _FETCHED=%r" %
+                  (pid, _FETCHED_OPENGODE_GO_MODELS), file=sys.stderr)
             provider = PROVIDERS[pid]
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             vbox.set_border_width(12)
@@ -3433,10 +3440,16 @@ def run_gui() -> int:
             opts = list(provider.model_options)
             if pid == "opencode":
                 if not _FETCHED_OPENGODE_GO_MODELS:
+                    print("[repodash]   → calling _fetch_opencode_go_models()",
+                          file=sys.stderr)
                     _fetch_opencode_go_models()
                 if _FETCHED_OPENGODE_GO_MODELS:
                     opts.append((_OPENGODE_GO_HEADER, ""))
                     opts.extend(_FETCHED_OPENGODE_GO_MODELS)
+                    print("[repodash]   → appended header + %d go models" %
+                          len(_FETCHED_OPENGODE_GO_MODELS), file=sys.stderr)
+                else:
+                    print("[repodash]   → no models to append", file=sys.stderr)
             widgets["model"] = combo_entry_row(
                 "Model:", "model", opts,
                 hint="freeform — pick a suggestion or type any model name/id")
