@@ -1474,6 +1474,14 @@ def run_gui() -> int:
             self.config = load_config()
             apply_config_to_env(self.config)
 
+        def quit(self):
+            """Force-quit even when a modal dialog (commit, push, settings, …)
+            is open.  Destroy all windows so that any blocking Gtk.Dialog.run()
+            call returns immediately, then hand off to Gtk.Application.quit()."""
+            for w in list(self.get_windows()):
+                w.destroy()
+            Gtk.Application.quit(self)
+
         # -- lifecycle --
         def do_startup(self):
             Gtk.Application.do_startup(self)
