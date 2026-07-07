@@ -45,3 +45,5 @@ tests/
 ## Git workflow
 
 Always commit to local `main` (never to a feature branch). Commit after every change — never leave `main` with uncommitted modifications.
+
+**Pre-push hook.** `bash scripts/install-hooks.sh` (once per clone) points `core.hooksPath` at `scripts/git-hooks/`. On every `git push` this runs the full test suite, the bash syntax check, the JSON parity gate, and `scripts/git-hooks/scan-personal-data.sh` — which scans outgoing commits for secrets (private keys, AWS/GitHub/Slack/Google API keys, JWTs) and machine-personal data (the pusher's `$HOME` path, their git email, other non-allowlisted email addresses). A failing scan blocks the push; emergency bypass is `git push --no-verify`.

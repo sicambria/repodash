@@ -37,3 +37,23 @@ jobs:
         run: bash tests/test_parity.sh
       - name: Full suite (includes bash render/JSON/ERE parity)
         run: python -m unittest discover -s tests -v
+
+  # Secrets / personal-data guardrail, mirroring the local pre-push hook
+  # (scripts/git-hooks/pre-push) so it still runs if a contributor pushed
+  # without installing hooks via scripts/install-hooks.sh.
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan outgoing commits for secrets / personal data
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            before="${{ github.event.pull_request.base.sha }}"
+            after="${{ github.event.pull_request.head.sha }}"
+          else
+            before="${{ github.event.before }}"
+            after="${{ github.sha }}"
+          fi
+          scripts/git-hooks/scan-personal-data.sh "$before" "$after"
