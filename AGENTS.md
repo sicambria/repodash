@@ -293,3 +293,21 @@ Body (optional):
 ```
 
 **Pre-push hook.** Install once per clone: `bash scripts/install-hooks.sh`. The hook runs on every push and blocks if tests, parity, syntax, or secrets scan fail. Emergency bypass: `git push --no-verify` (only when the hook itself is broken — fix it afterward).
+
+**Worktree workflow for longer work.** For non-trivial multi-step work, use a git worktree instead of working directly on `main`:
+
+1. **Check main is clean:** `git status --porcelain` must be empty. If not, stop.
+2. **Create worktree:** `git worktree add ../repodash-wip -b wip/<description>`
+3. **Work in the worktree** (`cd ../repodash-wip`), committing incrementally.
+4. **Merge back to main:**
+   ```
+   cd /path/to/repodash          # back to main repo
+   git merge wip/<description>   # merge the worktree branch into main
+   ```
+5. **Verify the code is in place:** `git log --oneline -5` confirms the merged commits are on `main`.
+6. **Tear down:**
+   ```
+   git worktree remove ../repodash-wip
+   git branch -d wip/<description>
+   ```
+   Never delete a worktree until the merge to `main` is confirmed.
