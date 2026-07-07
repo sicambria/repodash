@@ -32,6 +32,7 @@ import sys
 # ── configuration ────────────────────────────────────────────────────────────
 DEFAULT_DEPTH = 3
 DEFAULT_INTERVAL = 90  # seconds between cheap menu refreshes
+EXPLAIN_TIMEOUT = 300  # seconds for the read-only "Explain changes" run
 VERSION = "1.0"
 CLAUDE_COMMAND = "claude --dangerously-skip-permissions"
 # Headless "Commit all": the claude binary (resolved via shutil.which) and the
@@ -89,6 +90,38 @@ PUSH_PROMPT = (
     "underlying issue (run tests, linter, or formatter; edit files as needed), "
     "then retry. Repeat until it succeeds.\n"
     "4. Do NOT commit new changes — only push what is already committed.\n"
+    "Work autonomously; never ask questions."
+)
+EXPLAIN_PROMPT = (
+    "You are operating non-interactively in a git repository. This is a "
+    "READ-ONLY analysis — do NOT modify, stage, commit, or push anything.\n"
+    "1. Inspect any uncommitted changes: `git status`, `git diff`, and "
+    "`git diff --staged`.\n"
+    "2. Inspect any local commits not yet pushed: `git log @{u}..HEAD` "
+    "(or, if the current branch has no upstream, `git log` on the current "
+    "branch to see its history).\n"
+    "3. Write a concise, plain-English explanation for a developer of what "
+    "changed and why it likely matters, as short bullet points. If both "
+    "uncommitted changes and unpushed commits are present, cover them in "
+    "separate sections; if only one is present, cover just that one.\n"
+    "Work autonomously; never ask questions and never ask for confirmation — "
+    "just report your findings as your final answer."
+)
+COMMIT_AND_PUSH_PROMPT = (
+    "You are operating non-interactively in a git repository. Follow THIS "
+    "repository's own workflow rules (e.g. CLAUDE.md / CONTRIBUTING) strictly.\n"
+    "1. Review the working-tree changes (git status, git diff). Group them into "
+    "logical commits — one coherent change per commit — and commit them on the "
+    "CURRENT branch with messages matching the repo's conventions.\n"
+    "2. If a commit fails (failing pre-commit hook, linter, formatter, tests, "
+    "etc.), do root-cause analysis, fix the underlying issue by editing files as "
+    "needed, and retry. Repeat until it succeeds.\n"
+    "3. Run `git push`. If the current branch has no upstream, find the remote "
+    "with `git remote` and run `git push -u <remote> HEAD` instead.\n"
+    "4. If the push is rejected due to a non-fast-forward divergence, run "
+    "`git pull --rebase` and retry the push. If rejected by a pre-push hook, "
+    "diagnose and fix the underlying issue, then retry. Repeat until it "
+    "succeeds.\n"
     "Work autonomously; never ask questions."
 )
 # Preference order; first one found on PATH wins unless REPODASH_TERMINAL is set.
@@ -703,6 +736,49 @@ def push_claude_stream_argv(bin_path: str, budget_usd: float,
     return argv
 
 
+def explain_stream_argv(bin_path: str, budget_usd: float,
+                        model: str = "", effort: str = "") -> list:
+    """argv for headless claude-explain (read-only) that streams live events."""
+    argv = [bin_path, "-p", EXPLAIN_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
+    return argv
+
+
+def commit_and_push_stream_argv(bin_path: str, budget_usd: float,
+                                model: str = "", effort: str = "") -> list:
+    """argv for headless commit-then-push that streams live events."""
+    argv = [bin_path, "-p", COMMIT_AND_PUSH_PROMPT,
+            "--dangerously-skip-permissions",
+            "--output-format", "stream-json", "--verbose"]
+    if budget_usd and float(budget_usd) > 0:
+        argv += ["--max-budget-usd", str(float(budget_usd))]
+    argv += _model_effort_args(model, effort)
+    return argv
+
+
+def explain_actions(r: dict) -> list:
+    """Which action buttons the Explain dialog should offer for repo *r*.
+
+    A subset of {"commit", "push", "commit_push"}, based purely on the cheap
+    git_status() fields already on hand — no extra probing.
+    """
+    actions = []
+    dirty = bool(r.get("count", 0))
+    has_remote = bool(r.get("has_remote"))
+    unpushed = bool(has_remote and r.get("unpushed", 0) > 0)
+    if dirty:
+        actions.append("commit")
+    if unpushed:
+        actions.append("push")
+    if dirty and has_remote:
+        actions.append("commit_push")
+    return actions
+
+
 def _fmt_stream_event(line: str) -> str:
     """Parse one stream-json line from claude into human-readable text.
 
@@ -1023,8 +1099,28 @@ def run_gui() -> int:
                 "error: no AppIndicator typelib found. Install "
                 "gir1.2-ayatanaappindicator3-0.1 (see tray/README.md).\n")
             return 1
-    from gi.repository import Gtk, GLib
+    from gi.repository import Gtk, GLib, Gdk
     import threading
+
+    def _screen_fraction_size(parent, w_frac=0.7, h_frac=0.7):
+        """(width, height) at *w_frac*/*h_frac* of the parent's monitor.
+
+        Falls back to the default display's primary monitor when *parent*
+        has no realized window (e.g. the tray has no dashboard open).
+        Clamped to a sane minimum so a tiny/unknown monitor never produces
+        an unusably small dialog.
+        """
+        display = Gdk.Display.get_default()
+        monitor = None
+        window = parent.get_window() if parent is not None else None
+        if display is not None and window is not None:
+            monitor = display.get_monitor_at_window(window)
+        if monitor is None and display is not None:
+            monitor = display.get_monitor(0)
+        if monitor is None:
+            return 480, 420
+        geo = monitor.get_geometry()
+        return max(400, int(geo.width * w_frac)), max(300, int(geo.height * h_frac))
 
     APP_ID = "org.repodash.Tray"
     ICON_SVG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1344,6 +1440,40 @@ def run_gui() -> int:
                 row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
                 argv_fn=push_claude_stream_argv))
 
+        def _on_commit_and_push_repo(self, r):
+            if self._op_running:
+                return
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            self._run_op_dialog(CommitAllDialog(
+                parent, [r],
+                cfg.get("commit_ram_mb", 2048),
+                cfg.get("commit_max_workers", 0),
+                cfg.get("commit_timeout", 3600),
+                cfg.get("commit_budget_usd", 10.0),
+                cfg.get("commit_model", "sonnet"),
+                cfg.get("commit_effort", "medium"),
+                verb="Commit & Push", verb_ing="Committing & pushing",
+                verb_past="Committed & pushed",
+                row_suffix=lambda rr: f"{rr.get('count', '')}",
+                argv_fn=commit_and_push_stream_argv))
+
+        def _on_explain_repo(self, r):
+            cfg = self.config
+            parent = self.window if (self.window and self.window.get_visible()) else None
+            dlg = ExplainDialog(parent, r,
+                                cfg.get("commit_budget_usd", 10.0),
+                                cfg.get("commit_model", "sonnet"),
+                                cfg.get("commit_effort", "medium"))
+            response = dlg.run()
+            dlg.destroy()
+            if response == ExplainDialog.RESPONSE_COMMIT:
+                self._on_commit_repo(r)
+            elif response == ExplainDialog.RESPONSE_PUSH:
+                self._on_push_claude_repo(r)
+            elif response == ExplainDialog.RESPONSE_COMMIT_PUSH:
+                self._on_commit_and_push_repo(r)
+
         def _on_wt_push_claude(self, wt, repo):
             if self._op_running:
                 return
@@ -1416,6 +1546,9 @@ def run_gui() -> int:
                          lambda *_: notify(self.window, *open_terminal(path)))
             self._action(sub, "Open Claude Code",
                          lambda *_: notify(self.window, *open_claude(path)))
+            if explain_actions(r):
+                self._action(sub, "Explain changes…",
+                             lambda *_, r=r: self._on_explain_repo(r))
             commit_label = "git commit" + (f" ({r['count']})" if r["count"] else "")
             self._action(sub, commit_label,
                          lambda *_: notify(self.window, *open_commit(path)))
@@ -1769,7 +1902,7 @@ def run_gui() -> int:
             self.add_button("Close", Gtk.ResponseType.CLOSE)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
             self.connect("delete-event", lambda *_: not self._done)
-            self.set_default_size(460, 400)
+            self.set_default_size(*_screen_fraction_size(parent))
 
             area = self.get_content_area()
             area.set_border_width(10)
@@ -2001,7 +2134,7 @@ def run_gui() -> int:
             self.add_button("Close", Gtk.ResponseType.CLOSE)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
             self.connect("delete-event", lambda *_: not self._done)
-            self.set_default_size(480, 420)
+            self.set_default_size(*_screen_fraction_size(parent))
 
             area = self.get_content_area()
             area.set_border_width(10)
@@ -2223,6 +2356,232 @@ def run_gui() -> int:
             self._stop_btn.set_sensitive(False)
             self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
             return False
+
+    class ExplainDialog(Gtk.Dialog):
+        """Read-only "explain this repo's changes" dialog, single repo.
+
+        Streams a headless claude run (same stream-json + Popen + _killpg
+        pattern as CommitAllDialog/PushAllDialog) so it can be cancelled and
+        never orphans a budget-spending process. Tool-call chatter goes in
+        the collapsed Details expander; the final "result" event becomes the
+        prominent explanation text. Response buttons for Commit/Push/Commit &
+        Push are built from explain_actions(r) and stay disabled until the
+        explain run finishes.
+        """
+
+        RESPONSE_COMMIT = 100
+        RESPONSE_PUSH = 101
+        RESPONSE_COMMIT_PUSH = 102
+
+        def __init__(self, parent, r, budget_usd, model="", effort=""):
+            super().__init__(title=f"Explain changes — {r['name']}",
+                             transient_for=parent, modal=True)
+            self._repo = r
+            self._budget = budget_usd
+            self._model = model
+            self._effort = effort
+            self._done = False
+            self._cancel = threading.Event()
+            self._proc = None
+            self._proc_lock = threading.Lock()
+
+            self.add_button("Close", Gtk.ResponseType.CLOSE)
+            self._action_codes = []
+            actions = explain_actions(r)
+            if "commit" in actions:
+                self.add_button("Commit…", self.RESPONSE_COMMIT)
+                self._action_codes.append(self.RESPONSE_COMMIT)
+            if "push" in actions:
+                self.add_button("Push…", self.RESPONSE_PUSH)
+                self._action_codes.append(self.RESPONSE_PUSH)
+            if "commit_push" in actions:
+                self.add_button("Commit & Push…", self.RESPONSE_COMMIT_PUSH)
+                self._action_codes.append(self.RESPONSE_COMMIT_PUSH)
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, False)
+            for code in self._action_codes:
+                self.set_response_sensitive(code, False)
+            self.connect("delete-event", lambda *_: not self._done)
+            self.set_default_size(*_screen_fraction_size(parent))
+
+            area = self.get_content_area()
+            area.set_border_width(10)
+            area.set_spacing(8)
+
+            bits = []
+            if r.get("count"):
+                bits.append(f"{r['count']} uncommitted")
+            if r.get("has_remote") and r.get("unpushed", 0) > 0:
+                bits.append(f"{r['unpushed']} unpushed")
+            subtitle = ", ".join(bits) or "no changes"
+            header = Gtk.Label(
+                label=f"{r['name']}  ({r.get('branch', '')}) — {subtitle}",
+                xalign=0)
+            area.pack_start(header, False, False, 0)
+
+            self._main_view = Gtk.TextView()
+            self._main_view.set_editable(False)
+            self._main_view.set_cursor_visible(False)
+            self._main_view.set_wrap_mode(Gtk.WrapMode.WORD)
+            self._main_view.set_left_margin(4)
+            self._main_view.set_right_margin(4)
+            self._main_view.get_buffer().set_text(
+                "Asking Claude Code to explain changes…")
+            main_scroll = Gtk.ScrolledWindow()
+            main_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                   Gtk.PolicyType.AUTOMATIC)
+            main_scroll.add(self._main_view)
+            area.pack_start(main_scroll, True, True, 0)
+
+            self._log = Gtk.TextView()
+            self._log.set_editable(False)
+            self._log.set_cursor_visible(False)
+            self._log.set_monospace(True)
+            self._log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            log_scroll = Gtk.ScrolledWindow()
+            log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                  Gtk.PolicyType.AUTOMATIC)
+            log_scroll.set_min_content_height(150)
+            log_scroll.add(self._log)
+            expander = Gtk.Expander(label="Details")
+            expander.add(log_scroll)
+            expander.set_expanded(False)
+            area.pack_start(expander, False, False, 0)
+
+            action_area = self.get_action_area()
+            self._stop_btn = Gtk.Button.new_with_label("Stop")
+            self._stop_btn.connect("clicked", self._on_stop)
+            action_area.pack_start(self._stop_btn, False, False, 0)
+            action_area.reorder_child(self._stop_btn, 0)
+
+            self.show_all()
+            self._start()
+
+        def _on_stop(self, *_):
+            dlg = Gtk.MessageDialog(
+                transient_for=self, modal=True,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.YES_NO,
+                text="Stop explaining?")
+            dlg.format_secondary_text(
+                "The running claude process will be killed.")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.YES:
+                return
+            self._cancel.set()
+            with self._proc_lock:
+                if self._proc is not None:
+                    self._killpg(self._proc)
+            self._stop_btn.set_sensitive(False)
+
+        @staticmethod
+        def _killpg(proc):
+            import signal as _sig
+            try:
+                os.killpg(os.getpgid(proc.pid), _sig.SIGKILL)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        @staticmethod
+        def _extract_result(line):
+            """The text of a stream-json "result" event, or None for other lines."""
+            import json as _json
+            try:
+                d = _json.loads(line)
+            except (ValueError, TypeError):
+                return None
+            if d.get("type") == "result":
+                return str(d.get("result", "")).strip()
+            return None
+
+        def _append_log(self, text):
+            buf = self._log.get_buffer()
+            buf.insert(buf.get_end_iter(), text)
+            end = buf.get_end_iter()
+            self._log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+            return False
+
+        def _set_result(self, text):
+            self._main_view.get_buffer().set_text(text or "(no explanation returned)")
+            return False
+
+        def _finish(self):
+            self._done = True
+            self._stop_btn.set_sensitive(False)
+            self.set_response_sensitive(Gtk.ResponseType.CLOSE, True)
+            for code in self._action_codes:
+                self.set_response_sensitive(code, True)
+            return False
+
+        def _start(self):
+            import time as _time
+
+            def work():
+                bin_path = shutil.which(CLAUDE_BIN)
+                if not bin_path:
+                    GLib.idle_add(self._set_result, "claude not found on PATH")
+                    GLib.idle_add(self._finish)
+                    return
+
+                argv = explain_stream_argv(bin_path, self._budget,
+                                           self._model, self._effort)
+                try:
+                    proc = subprocess.Popen(
+                        argv, cwd=self._repo["path"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, start_new_session=True)
+                except (OSError, subprocess.SubprocessError) as e:
+                    GLib.idle_add(self._append_log, f"Error: {e}\n")
+                    GLib.idle_add(self._set_result, f"Error: {e}")
+                    GLib.idle_add(self._finish)
+                    return
+
+                with self._proc_lock:
+                    self._proc = proc
+
+                def _kill_on_timeout():
+                    _time.sleep(EXPLAIN_TIMEOUT)
+                    if proc.poll() is None:
+                        self._killpg(proc)
+                        GLib.idle_add(self._append_log,
+                                      f"timed out after {EXPLAIN_TIMEOUT}s\n")
+
+                threading.Thread(target=_kill_on_timeout, daemon=True).start()
+
+                result_text = ""
+                try:
+                    for raw in proc.stdout:
+                        if self._cancel.is_set():
+                            self._killpg(proc)
+                            GLib.idle_add(self._append_log, "Stopped\n")
+                            break
+                        res = self._extract_result(raw)
+                        if res is not None:
+                            result_text = res
+                        text = _fmt_stream_event(raw)
+                        if text:
+                            GLib.idle_add(self._append_log, text)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self._killpg(proc)
+                        proc.wait()
+                    with self._proc_lock:
+                        self._proc = None
+
+                if self._cancel.is_set() and not result_text:
+                    result_text = "Stopped before finishing."
+                GLib.idle_add(self._set_result, result_text)
+                GLib.idle_add(self._finish)
+
+            threading.Thread(target=work, daemon=True).start()
 
     class ConfigDialog(Gtk.Dialog):
         def __init__(self, parent, config):

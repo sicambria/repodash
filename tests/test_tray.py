@@ -1280,6 +1280,99 @@ class StreamArgvTest(unittest.TestCase):
         self.assertIn("high", argv)
 
 
+class ExplainStreamArgvTest(unittest.TestCase):
+    def test_contains_headless_flags(self):
+        argv = tray.explain_stream_argv("/x/claude", 10.0)
+        self.assertEqual(argv[0], "/x/claude")
+        self.assertIn("-p", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)
+        self.assertIn("--max-budget-usd", argv)
+        self.assertIn("10.0", argv)
+        self.assertEqual(argv[argv.index("-p") + 1], tray.EXPLAIN_PROMPT)
+
+    def test_zero_budget_omits_flag(self):
+        argv = tray.explain_stream_argv("/x/claude", 0)
+        self.assertNotIn("--max-budget-usd", argv)
+
+    def test_model_and_effort_flags(self):
+        argv = tray.explain_stream_argv("/x/claude", 10.0, "opus", "high")
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    def test_empty_model_and_effort_omit_flags(self):
+        argv = tray.explain_stream_argv("/x/claude", 10.0, "", "")
+        self.assertNotIn("--model", argv)
+        self.assertNotIn("--effort", argv)
+
+    def test_prompt_is_read_only(self):
+        self.assertIn("READ-ONLY", tray.EXPLAIN_PROMPT)
+        self.assertIn("do NOT modify", tray.EXPLAIN_PROMPT)
+
+
+class CommitAndPushStreamArgvTest(unittest.TestCase):
+    def test_contains_headless_flags(self):
+        argv = tray.commit_and_push_stream_argv("/x/claude", 10.0)
+        self.assertEqual(argv[0], "/x/claude")
+        self.assertIn("-p", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)
+        self.assertIn("--max-budget-usd", argv)
+        self.assertEqual(argv[argv.index("-p") + 1], tray.COMMIT_AND_PUSH_PROMPT)
+
+    def test_zero_budget_omits_flag(self):
+        argv = tray.commit_and_push_stream_argv("/x/claude", 0)
+        self.assertNotIn("--max-budget-usd", argv)
+
+    def test_model_and_effort_flags(self):
+        argv = tray.commit_and_push_stream_argv("/x/claude", 10.0, "opus", "high")
+        self.assertIn("--model", argv)
+        self.assertIn("opus", argv)
+        self.assertIn("--effort", argv)
+        self.assertIn("high", argv)
+
+    def test_prompt_differs_and_covers_commit_and_push(self):
+        self.assertNotEqual(tray.COMMIT_AND_PUSH_PROMPT, tray.COMMIT_PROMPT)
+        self.assertNotEqual(tray.COMMIT_AND_PUSH_PROMPT, tray.PUSH_PROMPT)
+        self.assertIn("git push", tray.COMMIT_AND_PUSH_PROMPT)
+        self.assertIn("push -u", tray.COMMIT_AND_PUSH_PROMPT)
+        self.assertIn("pull --rebase", tray.COMMIT_AND_PUSH_PROMPT)
+        self.assertNotIn("merge", tray.COMMIT_AND_PUSH_PROMPT.lower())
+
+
+class ExplainActionsTest(unittest.TestCase):
+    def test_dirty_only_no_remote(self):
+        r = {"count": 2, "has_remote": False, "unpushed": 0}
+        self.assertEqual(tray.explain_actions(r), ["commit"])
+
+    def test_dirty_only_with_remote(self):
+        r = {"count": 2, "has_remote": True, "unpushed": 0}
+        self.assertEqual(tray.explain_actions(r), ["commit", "commit_push"])
+
+    def test_unpushed_only(self):
+        r = {"count": 0, "has_remote": True, "unpushed": 3}
+        self.assertEqual(tray.explain_actions(r), ["push"])
+
+    def test_dirty_and_unpushed(self):
+        r = {"count": 2, "has_remote": True, "unpushed": 3}
+        self.assertEqual(tray.explain_actions(r),
+                        ["commit", "push", "commit_push"])
+
+    def test_clean_and_pushed(self):
+        r = {"count": 0, "has_remote": True, "unpushed": 0}
+        self.assertEqual(tray.explain_actions(r), [])
+
+    def test_unpushed_without_remote_is_ignored(self):
+        # has_remote False should never happen alongside unpushed > 0 (see
+        # git_status()), but guard against it defensively.
+        r = {"count": 0, "has_remote": False, "unpushed": 3}
+        self.assertEqual(tray.explain_actions(r), [])
+
+
 class CommitRepoMoreTest(unittest.TestCase):
     def setUp(self):
         self._which = tray.shutil.which
