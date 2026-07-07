@@ -278,7 +278,7 @@ The tray never imports or modifies `repodash.py`. Communication is one-way: subp
 
 ## Git workflow
 
-Always commit to local `main` (never to a feature branch). Commit after every change — never leave `main` with uncommitted modifications.
+Always commit to local `main` (never to a feature branch). Commit after every change — never leave `main` with uncommitted modifications. **Do not bundle unrelated changes into a single commit.** Each commit should encompass exactly one logical change.
 
 **No `Co-Authored-By` trailer.** Do not append a `Co-Authored-By: Claude ...` line to commit messages.
 
