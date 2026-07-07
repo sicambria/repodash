@@ -1358,7 +1358,7 @@ def run_check() -> int:
     for r in dirty:
         track = ""
         if r["ahead"] or r["behind"]:
-            track = f"  ↑{r['ahead']} ↓{r['behind']}"
+            track = f"  ▲{r['ahead']} ▼{r['behind']}"
         gh = github_url(r["path"])
         print(f"  • {r['name']}  [{r['branch']}{track}]  "
               f"{r['count']} file(s)" + (f"  {gh}" if gh else ""))
@@ -1380,7 +1380,7 @@ def run_check() -> int:
     if idle_all:
         print("\nidle wt   :")
         for r, w in idle_all:
-            behind_s = f"  ↓{w['behind']}" if w["behind"] else ""
+            behind_s = f"  ▼{w['behind']}" if w["behind"] else ""
             print(f"  ⏸ {r['name']}  [{w['branch']}]  "
                   f"{_format_age(w['last_commit_age_hours'])} ago{behind_s}")
     merged_all = [(r, w) for r in repos
@@ -1848,7 +1848,7 @@ def run_gui() -> int:
             else:
                 track = ""
                 if r["ahead"] or r["behind"]:
-                    track = f" ↑{r['ahead']}↓{r['behind']}"
+                    track = f" ▲{r['ahead']}▼{r['behind']}"
                 label = f"{r['name']}  ({r['branch']}{track}, {r['count']})"
             item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
@@ -1890,7 +1890,7 @@ def run_gui() -> int:
             elif severity == "merged":
                 label = f"  {wt['branch']}  {age_str} ago (absorbed in main)"
             else:
-                behind_s = f"  ↓{wt['behind']}" if wt["behind"] else ""
+                behind_s = f"  ▼{wt['behind']}" if wt["behind"] else ""
                 label = f"  {wt['branch']}  {age_str} ago{behind_s}"
             item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
@@ -2121,7 +2121,7 @@ def run_gui() -> int:
             todos = repo.get("todos", {})
             track = ""
             if git.get("ahead") or git.get("behind"):
-                track = f"  ↑{git.get('ahead', 0)}↓{git.get('behind', 0)}"
+                track = f"  ▲{git.get('ahead', 0)}▼{git.get('behind', 0)}"
             dirty_n = len(git.get("dirty_files", []))
             title = Gtk.Label(xalign=0)
             mark = "●" if git.get("dirty") else "○"
@@ -2158,7 +2158,7 @@ def run_gui() -> int:
             box.pack_start(self._btn("system-run", ai_label,
                                      lambda *_: notify(self, *open_provider_terminal(path, pid))),
                            False, False, 0)
-            push_tip = "git push" + (f" (↑{git.get('ahead')})" if git.get("ahead") else "")
+            push_tip = "git push" + (f" (▲{git.get('ahead')})" if git.get("ahead") else "")
             box.pack_start(self._btn("go-up", push_tip,
                                      lambda *_: notify(self, *open_push(path))),
                            False, False, 0)
@@ -2486,7 +2486,7 @@ def run_gui() -> int:
                 else:
                     track = ""
                     if r.get("ahead") or r.get("behind"):
-                        track = f" ↑{r['ahead']}↓{r['behind']}"
+                        track = f" ▲{r['ahead']}▼{r['behind']}"
                     row_label = f"{r['name']}  ({r['branch']}{track}, {r.get('count', '')})"
                 name = Gtk.Label(label=row_label, xalign=0)
                 box.pack_start(mark, False, False, 0)
@@ -3311,7 +3311,7 @@ def run_gui() -> int:
                 completion = Gtk.EntryCompletion()
                 completion.set_model(store)
                 completion.set_text_column(0)
-                completion.set_minimum_keyboard_length(1)
+                completion.set_minimum_key_length(1)
                 completion.set_match_func(
                     lambda _c, key, it: key.lower() in store[it][0].lower())
                 entry.set_completion(completion)
