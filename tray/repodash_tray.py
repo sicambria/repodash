@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -37,6 +38,9 @@ DEFAULT_DEPTH = 3
 DEFAULT_INTERVAL = 90  # seconds between cheap menu refreshes
 EXPLAIN_TIMEOUT = 300  # seconds for the read-only "Explain changes" run
 VERSION = "1.0"
+_OPENGODE_GO_FETCH_TIMEOUT = 15
+_OPENGODE_GO_HEADER = "━━━ OpenCode Go ━━━"
+_FETCHED_OPENGODE_GO_MODELS = None
 CLAUDE_COMMAND = "claude --dangerously-skip-permissions"
 # Headless "Commit all": the claude binary (resolved via shutil.which) and the
 # instruction it runs non-interactively per repo. The run is bounded by a dollar
@@ -1144,6 +1148,34 @@ PROVIDERS = {
 HEADLESS_PROVIDER_IDS = [pid for pid, p in PROVIDERS.items() if p.headless]
 
 
+def _fetch_opencode_go_models():
+    global _FETCHED_OPENGODE_GO_MODELS
+    try:
+        result = subprocess.run(
+            ["opencode", "models", "opencode-go"],
+            capture_output=True, text=True, timeout=_OPENGODE_GO_FETCH_TIMEOUT,
+        )
+        if result.returncode != 0:
+            print("[repodash] opencode models failed rc=%d stderr=%s" %
+                  (result.returncode, result.stderr.strip()[:200]),
+                  file=sys.stderr)
+            _FETCHED_OPENGODE_GO_MODELS = []
+            return
+        models = [line.strip() for line in result.stdout.splitlines()
+                  if line.strip()]
+        _FETCHED_OPENGODE_GO_MODELS = [(m, m) for m in models]
+        print("[repodash] fetched %d models from opencode-go" % len(models),
+              file=sys.stderr)
+    except FileNotFoundError:
+        print("[repodash] opencode binary not found on PATH", file=sys.stderr)
+        _FETCHED_OPENGODE_GO_MODELS = []
+    except subprocess.TimeoutExpired:
+        print("[repodash] opencode models timed out", file=sys.stderr)
+        _FETCHED_OPENGODE_GO_MODELS = []
+    except OSError as e:
+        print("[repodash] opencode models OS error: %s" % e, file=sys.stderr)
+        _FETCHED_OPENGODE_GO_MODELS = []
+
 def open_provider_terminal(path: str, provider_id: str = "claude"):
     """Open an interactive terminal running *provider_id*'s CLI in *path*."""
     provider = PROVIDERS.get(provider_id) or PROVIDERS["claude"]
@@ -1504,6 +1536,7 @@ def run_gui() -> int:
             self.indicator.set_title("repodash")
             self.indicator.set_menu(self._build_menu())
             self.refresh_menu()
+            threading.Thread(target=_fetch_opencode_go_models, daemon=True).start()
             self._timer_id = GLib.timeout_add_seconds(
                 resolve_interval(self.config), self._on_timer)
 
@@ -3358,17 +3391,23 @@ def run_gui() -> int:
                 combo = Gtk.ComboBoxText.new_with_entry()
                 for opt_id, _opt_label in options:
                     combo.append_text(opt_id)
+                combo.set_row_separator_func(
+                    lambda model, it: model[it][0] == _OPENGODE_GO_HEADER)
                 current = self._config["ai_providers"].get(pid, {}).get(key, "")
                 combo.get_child().set_text(current)
 
                 store = combo.get_model()
                 entry = combo.get_child()
+                completion_store = Gtk.ListStore(str)
+                for opt_id, _opt_label in options:
+                    if opt_id != _OPENGODE_GO_HEADER:
+                        completion_store.append([opt_id])
                 completion = Gtk.EntryCompletion()
-                completion.set_model(store)
+                completion.set_model(completion_store)
                 completion.set_text_column(0)
                 completion.set_minimum_key_length(1)
                 completion.set_match_func(
-                    lambda _c, key, it: key.lower() in store[it][0].lower())
+                    lambda _c, key, it: key.lower() in completion_store[it][0].lower())
                 entry.set_completion(completion)
 
                 hbox.pack_start(combo, False, False, 0)
@@ -3390,8 +3429,15 @@ def run_gui() -> int:
                 note.get_style_context().add_class("dim-label")
                 vbox.pack_start(note, False, False, 0)
 
+            opts = list(provider.model_options)
+            if pid == "opencode":
+                if not _FETCHED_OPENGODE_GO_MODELS:
+                    _fetch_opencode_go_models()
+                if _FETCHED_OPENGODE_GO_MODELS:
+                    opts.append((_OPENGODE_GO_HEADER, ""))
+                    opts.extend(_FETCHED_OPENGODE_GO_MODELS)
             widgets["model"] = combo_entry_row(
-                "Model:", "model", provider.model_options,
+                "Model:", "model", opts,
                 hint="freeform — pick a suggestion or type any model name/id")
             if provider.effort_options:
                 widgets["effort"] = combo_entry_row(

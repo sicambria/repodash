@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -2023,9 +2024,107 @@ class ProviderModelComboConstructionTest(unittest.TestCase):
         match("hy3", 1)
         match("nonexistent", 0)
 
+    def test_fetch_opencode_go_models_parses_output(self):
+        with mock.patch.object(tray.subprocess, "run") as mock_run:
+            mock_run.return_value = mock.Mock(
+                stdout="opencode-go/deepseek-v4-flash\nopencode-go/qwen3.7-plus\n",
+                returncode=0,
+            )
+            try:
+                tray._fetch_opencode_go_models()
+                self.assertEqual(
+                    tray._FETCHED_OPENGODE_GO_MODELS,
+                    [("opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4-flash"),
+                     ("opencode-go/qwen3.7-plus", "opencode-go/qwen3.7-plus")],
+                )
+            finally:
+                tray._FETCHED_OPENGODE_GO_MODELS = None
+
+    @mock.patch.object(tray.subprocess, "run")
+    def test_fetch_opencode_go_models_handles_error(self, mock_run):
+        mock_run.return_value = mock.Mock(returncode=1, stdout="", stderr="")
+        try:
+            tray._fetch_opencode_go_models()
+            self.assertEqual(tray._FETCHED_OPENGODE_GO_MODELS, [])
+        finally:
+            tray._FETCHED_OPENGODE_GO_MODELS = None
+
     def test_empty_model_does_not_crash(self):
         """A provider with no model options (empty list) must still build."""
         self._make_combo_with_completion([])
+
+
+# ── previously untested internal helpers ─────────────────────────────────────
+class ExtractResultClaudeTest(unittest.TestCase):
+    def test_result_type_extracts_content(self):
+        self.assertEqual(
+            tray._extract_result_claude('{"type": "result", "result": "done"}'),
+            "done")
+
+    def test_non_result_type_returns_none(self):
+        self.assertIsNone(
+            tray._extract_result_claude('{"type": "assistant", "content": []}'))
+
+    def test_non_json_returns_none(self):
+        self.assertIsNone(tray._extract_result_claude("not json at all"))
+
+    def test_result_without_result_field(self):
+        self.assertEqual(
+            tray._extract_result_claude('{"type": "result"}'), "")
+
+
+class WorktreeCmdTest(unittest.TestCase):
+    def test_claude_worktree_cmd_format(self):
+        cmd = tray._claude_worktree_cmd("/usr/bin/claude", "do the thing")
+        self.assertIn("/usr/bin/claude", cmd)
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertIn("-p", cmd)
+        self.assertIn("do the thing", cmd)
+
+    def test_opencode_worktree_cmd_format(self):
+        cmd = tray._opencode_worktree_cmd("/usr/bin/opencode", "do the thing")
+        self.assertIn("/usr/bin/opencode", cmd)
+        self.assertIn("run", cmd)
+        self.assertIn("--auto", cmd)
+        self.assertIn("do the thing", cmd)
+
+    def test_codex_worktree_cmd_format(self):
+        cmd = tray._codex_worktree_cmd("/usr/bin/codex", "do the thing")
+        self.assertIn("/usr/bin/codex", cmd)
+        self.assertIn("exec", cmd)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        self.assertIn("do the thing", cmd)
+
+    def test_keep_open_wraps_in_bash(self):
+        self.assertEqual(
+            tray._keep_open("git push"), "git push; exec bash")
+
+
+class AutostartContentsTest(unittest.TestCase):
+    def test_has_required_sections(self):
+        content = tray._autostart_contents()
+        self.assertIn("[Desktop Entry]", content)
+        self.assertIn("repodash_tray.py", content)
+        self.assertIn("X-GNOME-Autostart-enabled=true", content)
+        self.assertIn("Comment=", content)
+        self.assertIn("Tray icon", content)
+
+
+class ModelEffortArgsTest(unittest.TestCase):
+    def test_both_set(self):
+        argv = tray._model_effort_args("opus", "high")
+        self.assertEqual(argv, ["--model", "opus", "--effort", "high"])
+
+    def test_model_only(self):
+        argv = tray._model_effort_args("opus", "")
+        self.assertEqual(argv, ["--model", "opus"])
+
+    def test_effort_only(self):
+        argv = tray._model_effort_args("", "high")
+        self.assertEqual(argv, ["--effort", "high"])
+
+    def test_neither_set(self):
+        self.assertEqual(tray._model_effort_args("", ""), [])
 
 
 if __name__ == "__main__":

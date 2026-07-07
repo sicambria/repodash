@@ -45,34 +45,31 @@ CI runs on Ubuntu, macOS, and Windows against Python 3.8 and 3.12. All tests use
 
 ### Phase 0 — Before you touch any code
 
-1. Read the rubrics in `docs/standards/`. Score the current project state if you're evaluating readiness.
+1. Read the rubrics in `docs/standards/`. Score the current project state against [`docs/standards/prevention-rubric.md`](./docs/standards/prevention-rubric.md) if evaluating readiness.
 2. Identify the change type:
    - **JSON model change** → both implementations must change → HIGH risk
    - **Single-implementation change** → only Python OR only Bash → LOW risk
    - **Test-only change** → fixtures or test methods → LOW risk
    - **Config/workflow change** → CI, hooks, scripts → MEDIUM risk
 
-### Phase 1 — Plan (Pass 1, target ≥ 80)
+### Phase 1 — Plan (scored against [`planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 1, target ≥ 80)
 
-Draft a plan answering these questions. Write it out. Score it against
-[`docs/standards/planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 1 criteria.
+Draft a plan answering these questions. Write it out. Score it.
 
 1. **Problem statement** — one sentence, falsifiable, references a test case or observed output.
-2. **Root cause hypothesis** — file:line + evidence.
+2. **Change hypothesis** — what contract, interface, or structure must change, and why?
 3. **Impact map** — every file/function/API contract touched, including callers.
 4. **Parity analysis** — does this touch the JSON model? If yes, cite exact lines in both `repodash.py` and `repodash`.
-5. **Constraint check** — stdlib-only? gi imports inside run_gui()? Pure function contract?
+5. **Constraint check** — stdlib-only? gi imports inside run_gui()? Pure function contract? Bash syntax?
 6. **Test plan** — existing tests to update, new tests to write, specific test method names.
 7. **Implementation order** — step-by-step with a verification command between each step.
 8. **Rollback plan** — specific files/commits to revert.
 
 Score the plan. If <80, identify the lowest-scoring criteria, revise, re-score. Do not proceed until ≥80.
 
-### Phase 2 — Architecture review (Pass 2, target ≥ 90)
+### Phase 2 — Architecture review (scored against [`planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 2 + [`code-review-rubric.md`](./docs/standards/code-review-rubric.md), target ≥ 90)
 
-Cross-check the plan against all rubrics. Score against
-[`docs/standards/planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 2 criteria AND
-[`docs/standards/code-review-rubric.md`](./docs/standards/code-review-rubric.md).
+Cross-check the plan against all rubrics:
 
 - Verify the parity contract: run `bash tests/test_parity.sh` BEFORE making changes to confirm it passes.
 - Verify hard constraints: run the evidence commands in [`docs/standards/code-review-rubric.md`](./docs/standards/code-review-rubric.md) C1–C4.
@@ -81,9 +78,7 @@ Cross-check the plan against all rubrics. Score against
 
 Score the architecture. If <90, iterate. Do not proceed until ≥90.
 
-### Phase 3 — Implement + Verify (Pass 3, target ≥ 95)
-
-Score against [`docs/standards/planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 3 criteria.
+### Phase 3 — Implement + Verify (scored against [`planning-rubric.md`](./docs/standards/planning-rubric.md) Pass 3, target ≥ 95)
 
 1. Implement in the order defined in the plan.
 2. After each step, run the verification command listed in the plan.
@@ -98,13 +93,13 @@ python3 -m unittest discover tests -v && bash tests/test_parity.sh && bash -n re
 
 ---
 
-## Error detection pipeline
+## Error detection pipeline (governed by [`prevention-rubric.md`](./docs/standards/prevention-rubric.md))
 
 The project has a layered detection pipeline. Use it. Do not skip layers.
 
 ```
-Save file → bash -n repodash  →  pre-push hook  →  CI  →  main
-                (syntax)        (full gates)    (matrix)
+Edit file  →  bash -n repodash   →  pre-push hook   →  CI matrix  →  main
+               (syntax, manual)      (full 4 gates)    (3 OS × 2 Py)
 ```
 
 ### Layer 1 — Syntax check (earliest)
@@ -117,24 +112,29 @@ Run after every edit to `repodash`. Catches unbalanced quotes, missing `fi`/`don
 ```bash
 # Installed once per clone: bash scripts/install-hooks.sh
 # Runs automatically on every git push:
-#   1. python3 -m unittest discover tests       (full test suite)
-#   2. bash -n repodash                          (syntax check)
-#   3. bash tests/test_parity.sh                 (JSON parity)
-#   4. scripts/git-hooks/scan-personal-data.sh   (secrets / personal data)
+#   1. python3 -m unittest discover tests        (full test suite, 216 tests)
+#   2. bash -n repodash                           (syntax check)
+#   3. bash tests/test_parity.sh                  (JSON parity)
+#   4. scripts/git-hooks/scan-personal-data.sh    (secrets / personal data)
 ```
 
 ### Layer 3 — CI (automated, multi-platform)
-CI runs on every push and PR across Ubuntu, macOS, Windows × Python 3.8, 3.12. It mirrors the pre-push checks plus platform-specific coverage. See `.github/workflows/ci.yml`.
+CI runs on every push and PR across Ubuntu, macOS, Windows × Python 3.8, 3.12. It runs the same four checks across three jobs:
+- **`python`** job: `python -m unittest discover -s tests -v` (full suite on all OS/Python combos)
+- **`bash-parity`** job: `bash -n repodash` + `bash tests/test_parity.sh` + `python -m unittest discover -s tests -v` (Ubuntu only)
+- **`guardrails`** job: `scripts/git-hooks/scan-personal-data.sh` (Ubuntu only)
+
+See `.github/workflows/ci.yml`.
 
 ### When a gate fails — STOP and RCA
 
-Do not attempt a fix without understanding the root cause. Follow the RCA protocol.
+Do not attempt a fix without understanding the root cause. Follow the RCA protocol below.
 
 ---
 
-## Root cause analysis (RCA) — mandatory when any gate fails
+## Root cause analysis (RCA) — governed by [`rca-rubric.md`](./docs/standards/rca-rubric.md)
 
-Follow [`docs/standards/rca-rubric.md`](./docs/standards/rca-rubric.md).
+Mandatory when any gate fails.
 
 ### Quickstart
 
@@ -143,16 +143,17 @@ Follow [`docs/standards/rca-rubric.md`](./docs/standards/rca-rubric.md).
 2. Isolate the delta: git diff HEAD~1  (or git log --oneline -5 if unsure)
 3. Hypothesize:       "Failure at X because Y changed at Z"
 4. Minimal repro:     reduce to a single command that reproduces the failure
-5. Eliminate:         syntax? imports? permissions? deps? env? — rule them out
+5. Eliminate:         syntax? imports? permissions? deps? env? — rule each out
 6. Fix the root cause, not the symptom
-7. Add a regression test that would have caught this
-8. Add a prevention measure (update a hook, CI step, or scan pattern)
-9. Document in the commit message body:
+7. Re-verify:         python3 -m unittest discover tests -v && bash tests/test_parity.sh && bash -n repodash
+8. Document in the commit message body:
       Root cause: <one line>
       Evidence:   <error message or diff>
       Fix:        <what changed and why>
       Prevention: <what gate was added/updated>
 ```
+
+After the quick fix, complete the full RCA scored against [`rca-rubric.md`](./docs/standards/rca-rubric.md) — especially the regression test (F2) and prevention measure (F3).
 
 ### Parity failure RCA (special case)
 
@@ -184,12 +185,14 @@ If a test fails → isolate the failing test method → read the test to underst
 python3 -m unittest tests.test_repodash.TestParity -v
 ```
 
+If the test itself may be broken (passes on old code, should have caught a bug but didn't), update the test AND the code.
+
 ### Loop 3 — Constraint violation
 If a hard constraint is violated (non-stdlib import, gi import at module scope, config object passed to pure function) → revert the violating change → re-design without the violation → re-implement.
 
 ---
 
-## Systemic prevention — shift-left enforcement
+## Systemic prevention — shift-left enforcement (governed by [`prevention-rubric.md`](./docs/standards/prevention-rubric.md))
 
 The goal: catch defects at the earliest possible stage and ensure the SAME defect cannot recur.
 
@@ -221,9 +224,9 @@ Then fix the hook and push again normally.
 
 ---
 
-## Hard constraints — DO NOT BREAK
+## Hard constraints — DO NOT BREAK (governed by [`code-review-rubric.md`](./docs/standards/code-review-rubric.md) C1–C4)
 
-These are pass/fail. Violating any of them blocks the change. Read [`docs/standards/code-review-rubric.md`](./docs/standards/code-review-rubric.md) C1–C4 for evidence commands.
+These are pass/fail. Violating any of them blocks the change.
 
 | # | Constraint | Why |
 |---|---|---|
@@ -234,7 +237,7 @@ These are pass/fail. Violating any of them blocks the change. Read [`docs/standa
 
 ---
 
-## The parity invariant — DO NOT BREAK
+## The parity invariant — DO NOT BREAK (governed by [`parity-rubric.md`](./docs/standards/parity-rubric.md))
 
 `repodash.py --json` and `repodash --json` must emit semantically identical JSON for the same inputs. The schema is defined in `repodash.py`; the Bash port must match it exactly. The parity gate (`TestParity` in `tests/test_repodash.py` and `tests/test_parity.sh`) enforces this.
 
