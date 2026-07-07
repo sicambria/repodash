@@ -3281,6 +3281,17 @@ def run_gui() -> int:
                     combo.append_text(opt_id)
                 current = self._config["ai_providers"].get(pid, {}).get(key, "")
                 combo.get_child().set_text(current)
+
+                store = combo.get_model()
+                entry = combo.get_child()
+                completion = Gtk.EntryCompletion()
+                completion.set_model(store)
+                completion.set_text_column(0)
+                completion.set_minimum_keyboard_length(1)
+                completion.set_match_func(
+                    lambda _c, key, it: key.lower() in store[it][0].lower())
+                entry.set_completion(completion)
+
                 hbox.pack_start(combo, False, False, 0)
                 if hint:
                     hl = Gtk.Label(label=hint, xalign=0.0)
