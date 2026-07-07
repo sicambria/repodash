@@ -11,7 +11,8 @@ window is opened or refreshed.
 
 Two surfaces:
   * a tray indicator whose menu lists only repos with a dirty working tree, each
-    with quick actions (terminal, Claude Code, GitHub, folder, copy path);
+    with quick actions (terminal, your configured AI CLI provider, GitHub,
+    folder, copy path);
   * a larger dashboard window listing every repo's status with search/filter.
 
 Run ``repodash_tray.py --check`` for a headless dump of what the tray sees
@@ -28,6 +29,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 # ── configuration ────────────────────────────────────────────────────────────
 DEFAULT_DEPTH = 3
@@ -144,12 +147,19 @@ CONFIG_DEFAULTS = {
     "excluded_repos": [],
     "terminal": "",
     "show_remoteless": True,
-    "commit_ram_mb": 2048,      # RAM budget per claude process (MB)
+    "commit_ram_mb": 2048,      # RAM budget per AI-provider process (MB)
     "commit_max_workers": 0,    # 0 = auto (RAM/CPU derived); >0 = hard cap
     "commit_timeout": 3600,     # seconds per repo (agentic runs are slow)
-    "commit_budget_usd": 10.0,  # max $ a single repo's claude run may spend
-    "commit_model": "sonnet",   # claude --model for headless commit/push runs
-    "commit_effort": "medium",  # claude --effort for headless commit/push runs
+    "commit_budget_usd": 10.0,  # max $ a single repo's run may spend (claude only)
+    "ai_primary_provider": "claude",
+    "ai_secondary_provider": "",       # "" = no fallback configured
+    "ai_fallback_enabled": True,
+    "ai_providers": {
+        "claude":   {"model": "sonnet", "effort": "medium"},
+        "opencode": {"model": "", "effort": ""},
+        "codex":    {"model": "", "effort": "medium"},
+        "gemini":   {"model": "", "effort": ""},
+    },
     "stale_worktree_idle_hours": 24,
     "stale_worktree_stuck_hours": 12,
     "show_stale_worktrees": True,
@@ -191,6 +201,8 @@ def load_config() -> dict:
     import json
     cfg = dict(CONFIG_DEFAULTS)
     cfg["excluded_repos"] = list(CONFIG_DEFAULTS["excluded_repos"])
+    cfg["ai_providers"] = {pid: dict(vals) for pid, vals
+                          in CONFIG_DEFAULTS["ai_providers"].items()}
     try:
         with open(config_file(), "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -198,6 +210,25 @@ def load_config() -> dict:
             for key in CONFIG_DEFAULTS:
                 if key in saved:
                     cfg[key] = saved[key]
+            # A saved ai_providers dict may predate a provider id added later
+            # (or predate this key entirely) — backfill any missing provider
+            # from defaults rather than leaving it absent (KeyError downstream).
+            if isinstance(cfg.get("ai_providers"), dict):
+                for pid, defaults in CONFIG_DEFAULTS["ai_providers"].items():
+                    cfg["ai_providers"].setdefault(pid, dict(defaults))
+            else:
+                cfg["ai_providers"] = {pid: dict(v) for pid, v
+                                       in CONFIG_DEFAULTS["ai_providers"].items()}
+            # One-time migration: a config saved before this change may still
+            # carry the old flat commit_model/commit_effort keys. Seed the
+            # claude provider's settings from them so upgrading doesn't
+            # silently reset a user's chosen model/effort.
+            if ("commit_model" in saved or "commit_effort" in saved) \
+                    and "claude" not in saved.get("ai_providers", {}):
+                cfg["ai_providers"]["claude"] = {
+                    "model": saved.get("commit_model", "sonnet"),
+                    "effort": saved.get("commit_effort", "medium"),
+                }
     except (OSError, ValueError):
         pass
     return cfg
@@ -917,6 +948,256 @@ def commit_repo(path: str, timeout: int = 900, budget_usd: float = 10.0,
     return out.returncode == 0, msg
 
 
+# ── multi-provider AI CLI registry ───────────────────────────────────────────
+# A "provider" is a real headless-capable agentic CLI. Claude Code is the
+# original/default; OpenCode and Codex are fully wired alternates a user can
+# pick as primary or configure as a fallback (tried once if the primary is
+# missing or a run fails/times out). Gemini CLI is detected and launchable
+# interactively, but its headless JSON event schema isn't confirmed stable
+# enough yet to wire into the commit/push/explain dialogs (headless=False).
+_TASK_PROMPTS = {
+    "commit": COMMIT_PROMPT,
+    "push": PUSH_PROMPT,
+    "commit_and_push": COMMIT_AND_PUSH_PROMPT,
+    "explain": EXPLAIN_PROMPT,
+}
+
+
+def resolve_tool_bin(bin_name: str) -> Optional[str]:
+    """shutil.which() for an AI CLI binary — single choke point so tests can
+    monkeypatch shutil.which and affect every provider consistently."""
+    return shutil.which(bin_name)
+
+
+def _claude_build_argv(bin_path, task, mode, budget_usd, model, effort):
+    if task == "commit":
+        fn = commit_argv if mode == "json" else commit_stream_argv
+    elif task == "push":
+        fn = push_claude_argv if mode == "json" else push_claude_stream_argv
+    elif task == "commit_and_push":
+        fn = commit_and_push_stream_argv
+    elif task == "explain":
+        fn = explain_stream_argv
+    else:
+        raise ValueError(f"unknown task: {task}")
+    return fn(bin_path, budget_usd, model, effort)
+
+
+def _opencode_build_argv(bin_path, task, mode, budget_usd, model, effort):
+    # No confirmed --max-budget-usd / effort-level equivalent for OpenCode;
+    # only --auto (approve-all) and --model are applied.
+    argv = [bin_path, "run", _TASK_PROMPTS[task], "--auto", "--format", "json"]
+    if model:
+        argv += ["--model", model]
+    return argv
+
+
+def _codex_build_argv(bin_path, task, mode, budget_usd, model, effort):
+    # No confirmed budget flag for Codex; --dangerously-bypass-approvals-and-sandbox
+    # is the closest analog to claude's --dangerously-skip-permissions.
+    argv = [bin_path, "exec", _TASK_PROMPTS[task],
+            "--dangerously-bypass-approvals-and-sandbox", "--json"]
+    if model:
+        argv += ["--model", model]
+    if effort:
+        argv += ["-c", f"model_reasoning_effort={effort}"]
+    return argv
+
+
+def _extract_result_claude(line: str):
+    import json as _json
+    try:
+        d = _json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if d.get("type") == "result":
+        return str(d.get("result", "")).strip()
+    return None
+
+
+def _extract_result_generic(line: str):
+    """Best-effort 'final answer' field lookup for providers whose JSON event
+    schema isn't confirmed. Returns None if the line isn't a JSON object or
+    has no recognizable result-ish field."""
+    import json as _json
+    try:
+        d = _json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    for key in ("result", "text", "message"):
+        val = d.get(key)
+        if val:
+            return str(val).strip()
+    return None
+
+
+def _fmt_stream_event_generic(line: str) -> str:
+    """Best-effort per-line formatter for providers with an unconfirmed JSON
+    schema (opencode, codex). An unrecognized/non-JSON line is echoed back
+    verbatim rather than dropped — an unconfirmed schema must degrade to
+    plain log lines, never break the run."""
+    import json as _json
+    try:
+        _json.loads(line)
+    except (ValueError, TypeError):
+        return line  # pass non-JSON through verbatim
+    result = _extract_result_generic(line)
+    return f"{result}\n" if result else ""
+
+
+def _claude_worktree_cmd(bin_path: str, prompt_text: str) -> str:
+    return f"{bin_path} --dangerously-skip-permissions -p {shlex.quote(prompt_text)}"
+
+
+def _opencode_worktree_cmd(bin_path: str, prompt_text: str) -> str:
+    return f"{bin_path} run {shlex.quote(prompt_text)} --auto"
+
+
+def _codex_worktree_cmd(bin_path: str, prompt_text: str) -> str:
+    return (f"{bin_path} exec {shlex.quote(prompt_text)} "
+            "--dangerously-bypass-approvals-and-sandbox")
+
+
+@dataclass
+class Provider:
+    id: str
+    label: str
+    bin_name: str
+    interactive_cmd: str
+    headless: bool
+    supports_budget: bool
+    model_options: list
+    effort_options: list
+    build_argv: Optional[Callable] = None
+    parse_event: Optional[Callable] = None
+    extract_result: Optional[Callable] = None
+    worktree_cmd: Optional[Callable] = None
+
+
+PROVIDERS = {
+    "claude": Provider(
+        id="claude", label="Claude Code", bin_name=CLAUDE_BIN,
+        interactive_cmd=CLAUDE_COMMAND,
+        headless=True, supports_budget=True,
+        model_options=[("sonnet", "Sonnet 5"), ("opus", "Opus")],
+        effort_options=[("medium", "Medium"), ("high", "High")],
+        build_argv=_claude_build_argv,
+        parse_event=_fmt_stream_event,
+        extract_result=_extract_result_claude,
+        worktree_cmd=_claude_worktree_cmd,
+    ),
+    "opencode": Provider(
+        id="opencode", label="OpenCode", bin_name="opencode",
+        interactive_cmd="opencode",
+        headless=True, supports_budget=False,
+        model_options=[("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
+                      ("openai/gpt-5.5", "GPT-5.5")],
+        effort_options=[],
+        build_argv=_opencode_build_argv,
+        parse_event=_fmt_stream_event_generic,
+        extract_result=_extract_result_generic,
+        worktree_cmd=_opencode_worktree_cmd,
+    ),
+    "codex": Provider(
+        id="codex", label="Codex", bin_name="codex",
+        interactive_cmd="codex",
+        headless=True, supports_budget=False,
+        model_options=[("gpt-5.5", "GPT-5.5")],
+        effort_options=[("low", "Low"), ("medium", "Medium"),
+                        ("high", "High"), ("xhigh", "Extra high")],
+        build_argv=_codex_build_argv,
+        parse_event=_fmt_stream_event_generic,
+        extract_result=_extract_result_generic,
+        worktree_cmd=_codex_worktree_cmd,
+    ),
+    "gemini": Provider(
+        id="gemini", label="Gemini CLI", bin_name="gemini",
+        interactive_cmd="gemini",
+        headless=False, supports_budget=False,
+        model_options=[("auto", "Auto"), ("pro", "Pro"), ("flash", "Flash")],
+        effort_options=[],
+    ),
+}
+
+HEADLESS_PROVIDER_IDS = [pid for pid, p in PROVIDERS.items() if p.headless]
+
+
+def open_provider_terminal(path: str, provider_id: str = "claude"):
+    """Open an interactive terminal running *provider_id*'s CLI in *path*."""
+    provider = PROVIDERS.get(provider_id) or PROVIDERS["claude"]
+    return open_terminal(path, provider.interactive_cmd)
+
+
+def open_wt_provider(wt_path: str, prompt_text: str, provider_id: str = "claude"):
+    """Open a terminal running *provider_id* headlessly with *prompt_text*."""
+    provider = PROVIDERS.get(provider_id) or PROVIDERS["claude"]
+    if not provider.headless or provider.worktree_cmd is None:
+        return False, f"{provider.label} does not support headless worktree actions"
+    bin_path = resolve_tool_bin(provider.bin_name)
+    if not bin_path:
+        return False, f"{provider.bin_name} not found on PATH"
+    cmd = provider.worktree_cmd(bin_path, prompt_text)
+    return open_terminal(wt_path, cmd)
+
+
+def _git_op_in_progress(path: str) -> bool:
+    """True if *path* has an interrupted git operation (rebase/merge/cherry-pick).
+
+    Handing a repo in this state to a second, different agent is worse than a
+    double commit — ``_repo_op_gate`` refuses to fall back when this is true.
+    """
+    git_dir = os.path.join(path, ".git")
+    markers = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")
+    return any(os.path.exists(os.path.join(git_dir, m)) for m in markers)
+
+
+def _repo_op_gate(path: str, task: str) -> str:
+    """After a provider attempt fails, decide whether it's safe to fall back.
+
+    Returns one of:
+      "ok_in_effect"    — re-derived state shows the work is already done (the
+                          failing exit code was misleading); no fallback.
+      "needs_attention" — an interrupted git operation was left behind; never
+                          hand this to a second, different agent.
+      "retry"           — work genuinely remains; safe to try the next provider.
+
+    Every prompt (COMMIT_PROMPT/PUSH_PROMPT/...) inspects current git state
+    before acting, so "retry" always means "do the remaining work", never
+    "replay a finished job" — this is what makes one extra hop safe.
+    """
+    if _git_op_in_progress(path):
+        return "needs_attention"
+    status = git_status(path)
+    if task in ("commit", "commit_and_push") and status["dirty"]:
+        return "retry"
+    if (task in ("push", "commit_and_push") and status["has_remote"]
+            and status["unpushed"] > 0):
+        return "retry"
+    if task in ("commit", "push", "commit_and_push"):
+        return "ok_in_effect"
+    return "retry"  # unknown/other task: default to giving the fallback a shot
+
+
+def provider_selection(cfg: dict) -> dict:
+    """Primary/secondary provider ids + fallback flag + resolved per-provider
+    model/effort, derived from *cfg*. Shared by every commit/push/explain
+    dialog so they all read the same primary/secondary/fallback settings."""
+    providers_cfg = cfg.get("ai_providers", {})
+    primary = cfg.get("ai_primary_provider", "claude")
+    secondary = cfg.get("ai_secondary_provider", "")
+    return {
+        "primary": primary,
+        "secondary": secondary if secondary and secondary != primary else "",
+        "fallback_enabled": bool(cfg.get("ai_fallback_enabled", True)),
+        "models": {pid: providers_cfg.get(pid, {}).get("model", "")
+                  for pid in PROVIDERS},
+        "efforts": {pid: providers_cfg.get(pid, {}).get("effort", "")
+                   for pid in PROVIDERS},
+    }
+
+
 # ── autostart (configurable from the menu) ───────────────────────────────────
 _AUTOSTART_NAME = "repodash-tray.desktop"
 
@@ -1029,13 +1310,22 @@ def run_check() -> int:
     cap_desc = f"cap {cap}" if cap else "auto"
     avail = _mem_available_mb()
     avail_desc = f"{avail} MB avail" if avail else "RAM unknown"
-    claude_bin = shutil.which(CLAUDE_BIN) or "(not on PATH)"
     print(f"commit    : {ram_mb} MB/proc, {cap_desc} → {workers} workers, "
           f"{cfg.get('commit_timeout', 3600)}s timeout, "
-          f"${cfg.get('commit_budget_usd', 10.0)}/repo  [{avail_desc}]")
-    print(f"  claude   : {claude_bin}  "
-          f"(model {cfg.get('commit_model', 'sonnet')}, "
-          f"effort {cfg.get('commit_effort', 'medium')})")
+          f"${cfg.get('commit_budget_usd', 10.0)}/repo (claude only)  [{avail_desc}]")
+
+    sel = provider_selection(cfg)
+    print(f"AI primary: {PROVIDERS.get(sel['primary'], PROVIDERS['claude']).label} "
+          f"({sel['primary']})")
+    print(f"AI fallback: "
+          f"{PROVIDERS[sel['secondary']].label if sel['secondary'] else '(none)'}"
+          f"  [{'enabled' if sel['fallback_enabled'] else 'disabled'}]")
+    for pid, provider in PROVIDERS.items():
+        bin_path = resolve_tool_bin(provider.bin_name) or "(not on PATH)"
+        detail = (f"model {sel['models'].get(pid) or '(default)'}"
+                 + (f", effort {sel['efforts'][pid]}" if sel["efforts"].get(pid) else ""))
+        headless_note = "" if provider.headless else "  [interactive-only]"
+        print(f"  {provider.label:<12}: {bin_path}  ({detail}){headless_note}")
 
     repos = scan_dirty(base, depth, cfg)
     repos = [r for r in repos if r["path"] not in excluded]
@@ -1252,7 +1542,7 @@ def run_gui() -> int:
                 clean.set_sensitive(False)
                 menu.append(clean)
             else:
-                self._action(menu, f"Commit all via Claude Code ({len(dirty)})…",
+                self._action(menu, f"Commit all via {self._ai_label()} ({len(dirty)})…",
                              lambda *_: self._on_commit_all())
 
             # Unpushed repos get their own section (a repo can be both dirty and
@@ -1266,7 +1556,7 @@ def run_gui() -> int:
                     menu.append(self._repo_item(r, unpushed=True))
                 self._action(menu, f"Push all ({len(unpushed)})…",
                              lambda *_: self._on_push_all())
-                self._action(menu, f"Push all via Claude Code ({len(unpushed)})…",
+                self._action(menu, f"Push all via {self._ai_label()} ({len(unpushed)})…",
                              lambda *_: self._on_push_claude_all())
 
             stuck_repos = [r for r in self.repos
@@ -1383,13 +1673,12 @@ def run_gui() -> int:
                                                 cfg.get("commit_max_workers", 0),
                                                 cfg.get("commit_timeout", 3600),
                                                 cfg.get("commit_budget_usd", 10.0),
-                                                cfg.get("commit_model", "sonnet"),
-                                                cfg.get("commit_effort", "medium")))
+                                                provider_selection(cfg), "commit"))
 
         def _on_commit_repo(self, r):
             if self._op_running:
                 return
-            # Single-repo counterpart to _on_commit_all: same headless-Claude
+            # Single-repo counterpart to _on_commit_all: same headless AI
             # flow (logical chunks, repo-conventional messages, docs, merge),
             # just scoped to one repo via the shared progress dialog.
             cfg = self.config
@@ -1399,8 +1688,7 @@ def run_gui() -> int:
                                                 cfg.get("commit_max_workers", 0),
                                                 cfg.get("commit_timeout", 3600),
                                                 cfg.get("commit_budget_usd", 10.0),
-                                                cfg.get("commit_model", "sonnet"),
-                                                cfg.get("commit_effort", "medium")))
+                                                provider_selection(cfg), "commit"))
 
         def _on_push_claude_repo(self, r):
             if self._op_running:
@@ -1413,11 +1701,9 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
-                cfg.get("commit_model", "sonnet"),
-                cfg.get("commit_effort", "medium"),
+                provider_selection(cfg), "push",
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
-                argv_fn=push_claude_stream_argv))
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}"))
 
         def _on_push_claude_all(self):
             if self._op_running:
@@ -1434,11 +1720,9 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
-                cfg.get("commit_model", "sonnet"),
-                cfg.get("commit_effort", "medium"),
+                provider_selection(cfg), "push",
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}",
-                argv_fn=push_claude_stream_argv))
+                row_suffix=lambda rr: f"+{rr.get('unpushed', 0)}"))
 
         def _on_commit_and_push_repo(self, r):
             if self._op_running:
@@ -1451,20 +1735,17 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
-                cfg.get("commit_model", "sonnet"),
-                cfg.get("commit_effort", "medium"),
+                provider_selection(cfg), "commit_and_push",
                 verb="Commit & Push", verb_ing="Committing & pushing",
                 verb_past="Committed & pushed",
-                row_suffix=lambda rr: f"{rr.get('count', '')}",
-                argv_fn=commit_and_push_stream_argv))
+                row_suffix=lambda rr: f"{rr.get('count', '')}"))
 
         def _on_explain_repo(self, r):
             cfg = self.config
             parent = self.window if (self.window and self.window.get_visible()) else None
             dlg = ExplainDialog(parent, r,
                                 cfg.get("commit_budget_usd", 10.0),
-                                cfg.get("commit_model", "sonnet"),
-                                cfg.get("commit_effort", "medium"))
+                                provider_selection(cfg))
             response = dlg.run()
             dlg.destroy()
             if response == ExplainDialog.RESPONSE_COMMIT:
@@ -1491,11 +1772,9 @@ def run_gui() -> int:
                 cfg.get("commit_max_workers", 0),
                 cfg.get("commit_timeout", 3600),
                 cfg.get("commit_budget_usd", 10.0),
-                cfg.get("commit_model", "sonnet"),
-                cfg.get("commit_effort", "medium"),
+                provider_selection(cfg), "push",
                 verb="Push", verb_ing="Pushing", verb_past="Pushed",
-                row_suffix=lambda rr: rr.get("branch", ""),
-                argv_fn=push_claude_stream_argv))
+                row_suffix=lambda rr: rr.get("branch", "")))
 
         def _on_help(self):
             parent = self.window if (self.window and self.window.get_visible()) else None
@@ -1511,8 +1790,8 @@ def run_gui() -> int:
             dlg.set_comments(
                 "A tray companion for your git repositories.\n"
                 "Monitors dirty repos, unpushed commits, and stale\n"
-                "worktrees — and launches Claude Code actions from\n"
-                "the menu."
+                "worktrees — and launches AI CLI actions (Claude Code,\n"
+                "OpenCode, Codex) from the menu."
             )
             dlg.set_copyright("© 2026 repodash contributors")
             dlg.set_license_type(Gtk.License.GPL_3_0)
@@ -1529,6 +1808,10 @@ def run_gui() -> int:
             dlg.run()
             dlg.destroy()
 
+        def _ai_label(self):
+            pid = self.config.get("ai_primary_provider", "claude")
+            return PROVIDERS.get(pid, PROVIDERS["claude"]).label
+
         def _repo_item(self, r, unpushed=False):
             if unpushed:
                 # In the unpushed section, lead with the unpushed-commit count
@@ -1542,10 +1825,12 @@ def run_gui() -> int:
             item = Gtk.MenuItem(label=label)
             sub = Gtk.Menu()
             path = r["path"]
+            ai_label = self._ai_label()
+            pid = self.config.get("ai_primary_provider", "claude")
             self._action(sub, "Open terminal",
                          lambda *_: notify(self.window, *open_terminal(path)))
-            self._action(sub, "Open Claude Code",
-                         lambda *_: notify(self.window, *open_claude(path)))
+            self._action(sub, f"Open {ai_label}",
+                         lambda *_: notify(self.window, *open_provider_terminal(path, pid)))
             if explain_actions(r):
                 self._action(sub, "Explain changes…",
                              lambda *_, r=r: self._on_explain_repo(r))
@@ -1553,13 +1838,13 @@ def run_gui() -> int:
             self._action(sub, commit_label,
                          lambda *_: notify(self.window, *open_commit(path)))
             if r["count"]:
-                self._action(sub, "Commit via Claude Code…",
+                self._action(sub, f"Commit via {ai_label}…",
                              lambda *_, r=r: self._on_commit_repo(r))
             push_label = "git push" + (f" (+{r['ahead']})" if r["ahead"] else "")
             self._action(sub, push_label,
                          lambda *_: notify(self.window, *open_push(path)))
             if r.get("has_remote") and r.get("unpushed", 0) > 0:
-                self._action(sub, "Push via Claude Code…",
+                self._action(sub, f"Push via {ai_label}…",
                              lambda *_, r=r: self._on_push_claude_repo(r))
             if r.get("github"):
                 self._action(sub, "Open GitHub",
@@ -1583,11 +1868,13 @@ def run_gui() -> int:
             sub = Gtk.Menu()
             path = wt["path"]
             repo_path = r["path"]
+            ai_label = self._ai_label()
+            pid = self.config.get("ai_primary_provider", "claude")
 
             self._action(sub, "Open terminal",
                          lambda *_, p=path: notify(self.window, *open_terminal(p)))
-            self._action(sub, "Open Claude Code",
-                         lambda *_, p=path: notify(self.window, *open_claude(p)))
+            self._action(sub, f"Open {ai_label}",
+                         lambda *_, p=path: notify(self.window, *open_provider_terminal(p, pid)))
 
             if severity == "stuck":
                 count = len([ln for ln in
@@ -1602,10 +1889,10 @@ def run_gui() -> int:
                 if ahead:
                     self._action(sub, f"git push (+{ahead})",
                                  lambda *_, p=path: notify(self.window, *open_push(p)))
-                    self._action(sub, "Push via Claude Code…",
+                    self._action(sub, f"Push via {ai_label}…",
                                  lambda *_, w=wt, rr=r: self._on_wt_push_claude(w, rr))
                 sub.append(Gtk.SeparatorMenuItem())
-                self._action(sub, "Finish & merge via Claude Code…",
+                self._action(sub, f"Finish & merge via {ai_label}…",
                              lambda *_, w=wt, rr=r: self._on_wt_finish(w, rr))
             elif severity == "merged":
                 sub.append(Gtk.SeparatorMenuItem())
@@ -1615,7 +1902,7 @@ def run_gui() -> int:
                              lambda *_, w=wt, rp=repo_path: self._on_wt_remove(w, rp))
             else:
                 sub.append(Gtk.SeparatorMenuItem())
-                self._action(sub, "Close via Claude Code…",
+                self._action(sub, f"Close via {ai_label}…",
                              lambda *_, w=wt, rr=r: self._on_wt_close(w, rr))
                 self._action(sub, "Remove worktree",
                              lambda *_, w=wt, rp=repo_path: self._on_wt_remove(w, rp))
@@ -1636,14 +1923,16 @@ def run_gui() -> int:
             tmpl = cfg.get("worktree_idle_close_prompt") or IDLE_CLOSE_PROMPT
             prompt = tmpl.format(path=wt["path"], branch=wt["branch"],
                                  repo_path=r["path"])
-            notify(self.window, *open_wt_claude(wt["path"], prompt))
+            notify(self.window, *open_wt_provider(
+                wt["path"], prompt, cfg.get("ai_primary_provider", "claude")))
 
         def _on_wt_finish(self, wt, r):
             cfg = self.config
             tmpl = cfg.get("worktree_stuck_finish_prompt") or STUCK_FINISH_PROMPT
             prompt = tmpl.format(path=wt["path"], branch=wt["branch"],
                                  repo_path=r["path"])
-            notify(self.window, *open_wt_claude(wt["path"], prompt))
+            notify(self.window, *open_wt_provider(
+                wt["path"], prompt, cfg.get("ai_primary_provider", "claude")))
 
         def _on_wt_remove(self, wt, repo_path):
             ok, msg = remove_worktree(repo_path, wt["path"])
@@ -1836,8 +2125,10 @@ def run_gui() -> int:
             box.pack_start(self._btn("utilities-terminal", "Terminal",
                                      lambda *_: notify(self, *open_terminal(path))),
                            False, False, 0)
-            box.pack_start(self._btn("system-run", "Claude Code",
-                                     lambda *_: notify(self, *open_claude(path))),
+            pid = self.config.get("ai_primary_provider", "claude")
+            ai_label = PROVIDERS.get(pid, PROVIDERS["claude"]).label
+            box.pack_start(self._btn("system-run", ai_label,
+                                     lambda *_: notify(self, *open_provider_terminal(path, pid))),
                            False, False, 0)
             push_tip = "git push" + (f" (↑{git.get('ahead')})" if git.get("ahead") else "")
             box.pack_start(self._btn("go-up", push_tip,
@@ -2096,34 +2387,36 @@ def run_gui() -> int:
             return False
 
     class CommitAllDialog(Gtk.Dialog):
-        """Modal progress window for committing/pushing repos via Claude Code.
+        """Modal progress window for committing/pushing repos via an AI CLI.
 
         Bounded-parallel (ThreadPoolExecutor, RAM-derived worker count). Each
-        repo's row goes ·→↻→✓/✗/⊘. Claude output streams live via stream-json
-        into the Details expander. A Stop button lets the user abort mid-run
-        (with a confirmation prompt) using process-group kill so no orphaned
-        children are left behind.
+        repo's row goes ·→↻→✓/✗/⊘. The provider's output streams live into the
+        Details expander. A Stop button lets the user abort mid-run (with a
+        confirmation prompt) using process-group kill so no orphaned children
+        are left behind.
 
-        ``argv_fn(bin_path, budget_usd, model, effort) → list`` selects the claude invocation.
-        Defaults to ``commit_stream_argv``; pass ``push_claude_stream_argv`` for
-        push-via-claude operations.
+        ``provider_sel`` (see ``provider_selection()``) selects the primary AI
+        provider and an optional secondary tried once, per repo, if the
+        primary is missing or its run fails/times out — gated by
+        ``_repo_op_gate`` so a fallback never double-commits/double-pushes or
+        hands an interrupted git operation to a second agent. ``task`` picks
+        the prompt/gate semantics: "commit" | "push" | "commit_and_push".
         """
 
         PENDING, RUNNING, OK, FAIL, STOPPED = "·", "↻", "✓", "✗", "⊘"
 
         def __init__(self, parent, repos, ram_mb, cap, timeout, budget_usd,
-                     model="", effort="",
+                     provider_sel=None, task="commit",
                      verb="Commit", verb_ing="Committing", verb_past="Committed",
-                     worker=None, row_suffix=None, argv_fn=None):
+                     worker=None, row_suffix=None):
             title = f"{verb} {repos[0]['name']}" if len(repos) == 1 else f"{verb} all"
             super().__init__(title=title, transient_for=parent, modal=True)
             self._repos = repos
             self._timeout = timeout
             self._budget = budget_usd
-            self._model = model
-            self._effort = effort
+            self._provider_sel = provider_sel or provider_selection(CONFIG_DEFAULTS)
+            self._task = task
             self._verb_past = verb_past
-            self._argv_fn = argv_fn if argv_fn is not None else commit_stream_argv
             self._row_suffix = row_suffix
             self._workers = commit_workers(ram_mb, cap)
             self._marks = {}  # path → status Gtk.Label
@@ -2230,9 +2523,73 @@ def run_gui() -> int:
                 except OSError:
                     pass
 
+        def _run_provider(self, r, provider, bin_path, multi):
+            """Run one provider attempt for repo *r*. Returns True on success.
+
+            Only called after the previous attempt (if any) for this repo has
+            fully exited — attempts are sequential, never concurrent, so a
+            fallback can never race the primary attempt it's replacing.
+            """
+            import time as _time
+
+            model = self._provider_sel["models"].get(provider.id, "")
+            effort = self._provider_sel["efforts"].get(provider.id, "")
+            argv = provider.build_argv(bin_path, self._task, "stream-json",
+                                       self._budget, model, effort)
+            GLib.idle_add(self._append_log, f"=== {r['name']} ({provider.label}) ===\n")
+
+            try:
+                proc = subprocess.Popen(
+                    argv, cwd=r["path"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                GLib.idle_add(self._append_log, f"[{r['name']}] Error: {e}\n")
+                return False
+
+            with self._procs_lock:
+                self._procs[r["path"]] = proc
+
+            # Kill after timeout regardless of whether we're reading.
+            timeout = self._timeout
+
+            def _kill_on_timeout():
+                _time.sleep(timeout)
+                if proc.poll() is None:
+                    self._killpg(proc)
+                    GLib.idle_add(
+                        self._append_log,
+                        f"[{r['name']}] timed out after {timeout}s\n")
+
+            threading.Thread(target=_kill_on_timeout, daemon=True).start()
+
+            try:
+                for raw in proc.stdout:
+                    if self._cancel.is_set():
+                        self._killpg(proc)
+                        GLib.idle_add(self._append_log,
+                                      f"[{r['name']}] Stopped\n")
+                        break
+                    text = provider.parse_event(raw)
+                    if text:
+                        prefix = f"[{r['name']}] " if multi else ""
+                        GLib.idle_add(self._append_log, prefix + text)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._killpg(proc)
+                    proc.wait()
+                with self._procs_lock:
+                    self._procs.pop(r["path"], None)
+
+            return proc.returncode == 0 and not self._cancel.is_set()
+
         def _start(self):
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            import time as _time
 
             total = len(self._repos)
             multi = total > 1  # prefix log lines with repo name when parallel
@@ -2242,66 +2599,52 @@ def run_gui() -> int:
                     return r, False
                 GLib.idle_add(self._mark, r["path"], self.RUNNING)
 
-                bin_path = shutil.which(CLAUDE_BIN)
-                if not bin_path:
-                    GLib.idle_add(self._append_log,
-                                  f"[{r['name']}] claude not found on PATH\n")
-                    return r, False
+                sel = self._provider_sel
+                order = [sel["primary"]]
+                if sel["fallback_enabled"] and sel["secondary"]:
+                    order.append(sel["secondary"])
 
-                argv = self._argv_fn(bin_path, self._budget, self._model, self._effort)
-                GLib.idle_add(self._append_log, f"=== {r['name']} ===\n")
-
-                try:
-                    proc = subprocess.Popen(
-                        argv, cwd=r["path"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, start_new_session=True)
-                except (OSError, subprocess.SubprocessError) as e:
-                    GLib.idle_add(self._append_log,
-                                  f"[{r['name']}] Error: {e}\n")
-                    return r, False
-
-                with self._procs_lock:
-                    self._procs[r["path"]] = proc
-
-                # Kill after timeout regardless of whether we're reading.
-                timeout = self._timeout
-
-                def _kill_on_timeout():
-                    _time.sleep(timeout)
-                    if proc.poll() is None:
-                        self._killpg(proc)
+                for i, pid in enumerate(order):
+                    provider = PROVIDERS.get(pid)
+                    if provider is None or not provider.headless:
                         GLib.idle_add(
                             self._append_log,
-                            f"[{r['name']}] timed out after {timeout}s\n")
+                            f"[{r['name']}] {pid} is not available for headless runs\n")
+                        continue
+                    bin_path = resolve_tool_bin(provider.bin_name)
+                    if not bin_path:
+                        GLib.idle_add(
+                            self._append_log,
+                            f"[{r['name']}] {provider.bin_name} not found on PATH\n")
+                        continue
 
-                threading.Thread(target=_kill_on_timeout, daemon=True).start()
+                    if self._run_provider(r, provider, bin_path, multi):
+                        return r, True
 
-                try:
-                    for raw in proc.stdout:
-                        if self._cancel.is_set():
-                            self._killpg(proc)
-                            GLib.idle_add(self._append_log,
-                                          f"[{r['name']}] Stopped\n")
-                            break
-                        text = _fmt_stream_event(raw)
-                        if text:
-                            prefix = f"[{r['name']}] " if multi else ""
-                            GLib.idle_add(self._append_log, prefix + text)
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        self._killpg(proc)
-                        proc.wait()
-                    with self._procs_lock:
-                        self._procs.pop(r["path"], None)
+                    if self._cancel.is_set() or i == len(order) - 1:
+                        return r, False
 
-                ok = proc.returncode == 0 and not self._cancel.is_set()
-                return r, ok
+                    gate = _repo_op_gate(r["path"], self._task)
+                    if gate == "ok_in_effect":
+                        GLib.idle_add(
+                            self._append_log,
+                            f"[{r['name']}] {provider.label} exited non-zero but the "
+                            "repo already reflects the finished work\n")
+                        return r, True
+                    if gate == "needs_attention":
+                        GLib.idle_add(
+                            self._append_log,
+                            f"[{r['name']}] interrupted git operation detected after "
+                            f"{provider.label} failed — needs manual review\n")
+                        return r, False
+                    next_provider = PROVIDERS.get(order[i + 1])
+                    next_label = next_provider.label if next_provider else order[i + 1]
+                    GLib.idle_add(
+                        self._append_log,
+                        f"[{r['name']}] {provider.label} failed — retrying with "
+                        f"{next_label}\n")
+
+                return r, False
 
             def work():
                 ok_count = 0
@@ -2360,26 +2703,29 @@ def run_gui() -> int:
     class ExplainDialog(Gtk.Dialog):
         """Read-only "explain this repo's changes" dialog, single repo.
 
-        Streams a headless claude run (same stream-json + Popen + _killpg
-        pattern as CommitAllDialog/PushAllDialog) so it can be cancelled and
-        never orphans a budget-spending process. Tool-call chatter goes in
-        the collapsed Details expander; the final "result" event becomes the
-        prominent explanation text. Response buttons for Commit/Push/Commit &
-        Push are built from explain_actions(r) and stay disabled until the
-        explain run finishes.
+        Streams a headless AI-provider run (same stream-json + Popen +
+        _killpg pattern as CommitAllDialog/PushAllDialog) so it can be
+        cancelled and never orphans a budget-spending process. Tool-call
+        chatter goes in the collapsed Details expander; the final "result"
+        event becomes the prominent explanation text. Response buttons for
+        Commit/Push/Commit & Push are built from explain_actions(r) and stay
+        disabled until the explain run finishes.
+
+        Explain is read-only, so — unlike commit/push — a failed primary
+        attempt falls back to the secondary provider unconditionally, with no
+        ``_repo_op_gate`` check (there is nothing it could double-do).
         """
 
         RESPONSE_COMMIT = 100
         RESPONSE_PUSH = 101
         RESPONSE_COMMIT_PUSH = 102
 
-        def __init__(self, parent, r, budget_usd, model="", effort=""):
+        def __init__(self, parent, r, budget_usd, provider_sel=None):
             super().__init__(title=f"Explain changes — {r['name']}",
                              transient_for=parent, modal=True)
             self._repo = r
             self._budget = budget_usd
-            self._model = model
-            self._effort = effort
+            self._provider_sel = provider_sel or provider_selection(CONFIG_DEFAULTS)
             self._done = False
             self._cancel = threading.Event()
             self._proc = None
@@ -2485,18 +2831,6 @@ def run_gui() -> int:
                 except OSError:
                     pass
 
-        @staticmethod
-        def _extract_result(line):
-            """The text of a stream-json "result" event, or None for other lines."""
-            import json as _json
-            try:
-                d = _json.loads(line)
-            except (ValueError, TypeError):
-                return None
-            if d.get("type") == "result":
-                return str(d.get("result", "")).strip()
-            return None
-
         def _append_log(self, text):
             buf = self._log.get_buffer()
             buf.insert(buf.get_end_iter(), text)
@@ -2516,68 +2850,98 @@ def run_gui() -> int:
                 self.set_response_sensitive(code, True)
             return False
 
-        def _start(self):
+        def _run_explain_provider(self, provider, bin_path):
+            """Run one explain attempt. Returns (ok, result_text)."""
             import time as _time
 
-            def work():
-                bin_path = shutil.which(CLAUDE_BIN)
-                if not bin_path:
-                    GLib.idle_add(self._set_result, "claude not found on PATH")
-                    GLib.idle_add(self._finish)
-                    return
+            model = self._provider_sel["models"].get(provider.id, "")
+            effort = self._provider_sel["efforts"].get(provider.id, "")
+            argv = provider.build_argv(bin_path, "explain", "stream-json",
+                                       self._budget, model, effort)
+            GLib.idle_add(self._append_log, f"=== {provider.label} ===\n")
+            try:
+                proc = subprocess.Popen(
+                    argv, cwd=self._repo["path"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True)
+            except (OSError, subprocess.SubprocessError) as e:
+                GLib.idle_add(self._append_log, f"Error: {e}\n")
+                return False, ""
 
-                argv = explain_stream_argv(bin_path, self._budget,
-                                           self._model, self._effort)
-                try:
-                    proc = subprocess.Popen(
-                        argv, cwd=self._repo["path"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, start_new_session=True)
-                except (OSError, subprocess.SubprocessError) as e:
-                    GLib.idle_add(self._append_log, f"Error: {e}\n")
-                    GLib.idle_add(self._set_result, f"Error: {e}")
-                    GLib.idle_add(self._finish)
-                    return
+            with self._proc_lock:
+                self._proc = proc
 
-                with self._proc_lock:
-                    self._proc = proc
+            def _kill_on_timeout():
+                _time.sleep(EXPLAIN_TIMEOUT)
+                if proc.poll() is None:
+                    self._killpg(proc)
+                    GLib.idle_add(self._append_log,
+                                  f"timed out after {EXPLAIN_TIMEOUT}s\n")
 
-                def _kill_on_timeout():
-                    _time.sleep(EXPLAIN_TIMEOUT)
-                    if proc.poll() is None:
+            threading.Thread(target=_kill_on_timeout, daemon=True).start()
+
+            result_text = ""
+            try:
+                for raw in proc.stdout:
+                    if self._cancel.is_set():
                         self._killpg(proc)
-                        GLib.idle_add(self._append_log,
-                                      f"timed out after {EXPLAIN_TIMEOUT}s\n")
+                        GLib.idle_add(self._append_log, "Stopped\n")
+                        break
+                    res = provider.extract_result(raw)
+                    if res is not None:
+                        result_text = res
+                    text = provider.parse_event(raw)
+                    if text:
+                        GLib.idle_add(self._append_log, text)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._killpg(proc)
+                    proc.wait()
+                with self._proc_lock:
+                    self._proc = None
 
-                threading.Thread(target=_kill_on_timeout, daemon=True).start()
+            return proc.returncode == 0 and not self._cancel.is_set(), result_text
+
+        def _start(self):
+            def work():
+                sel = self._provider_sel
+                order = [sel["primary"]]
+                if sel["fallback_enabled"] and sel["secondary"]:
+                    order.append(sel["secondary"])
 
                 result_text = ""
-                try:
-                    for raw in proc.stdout:
-                        if self._cancel.is_set():
-                            self._killpg(proc)
-                            GLib.idle_add(self._append_log, "Stopped\n")
-                            break
-                        res = self._extract_result(raw)
-                        if res is not None:
-                            result_text = res
-                        text = _fmt_stream_event(raw)
-                        if text:
-                            GLib.idle_add(self._append_log, text)
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        self._killpg(proc)
-                        proc.wait()
-                    with self._proc_lock:
-                        self._proc = None
+                ok = False
+                for pid in order:
+                    if self._cancel.is_set():
+                        break
+                    provider = PROVIDERS.get(pid)
+                    if provider is None or not provider.headless:
+                        GLib.idle_add(self._append_log,
+                                      f"{pid} is not available for headless runs\n")
+                        continue
+                    bin_path = resolve_tool_bin(provider.bin_name)
+                    if not bin_path:
+                        GLib.idle_add(self._append_log,
+                                      f"{provider.bin_name} not found on PATH\n")
+                        continue
+                    ok, text = self._run_explain_provider(provider, bin_path)
+                    if text:
+                        result_text = text
+                    # Read-only, so — unlike commit/push — fall back on any
+                    # failure with no _repo_op_gate check: there is nothing a
+                    # second attempt could double-do.
+                    if ok or self._cancel.is_set():
+                        break
 
                 if self._cancel.is_set() and not result_text:
                     result_text = "Stopped before finishing."
+                elif not result_text and not ok:
+                    result_text = "(no explanation returned — is an AI CLI installed?)"
                 GLib.idle_add(self._set_result, result_text)
                 GLib.idle_add(self._finish)
 
@@ -2591,7 +2955,16 @@ def run_gui() -> int:
             self._config = dict(config)
             self._config["excluded_repos"] = list(
                 config.get("excluded_repos", []))
-            self._repo_checks = {}  # path -> Gtk.CheckButton
+            # Deep-copy the per-provider sub-dicts: dict(config) above only
+            # shallow-copies, so without this, editing a provider's model in
+            # the dialog would mutate the caller's live config in place even
+            # if the user hits Cancel.
+            self._config["ai_providers"] = {
+                pid: dict(vals) for pid, vals
+                in config.get("ai_providers", CONFIG_DEFAULTS["ai_providers"]).items()
+            }
+            self._repo_checks = {}    # path -> Gtk.CheckButton
+            self._provider_widgets = {}  # provider id -> {"model": combo, "effort": combo|None}
 
             notebook = Gtk.Notebook()
             notebook.append_page(self._build_general_tab(),
@@ -2600,10 +2973,13 @@ def run_gui() -> int:
                                  Gtk.Label(label="Git"))
             notebook.append_page(self._build_repos_tab(),
                                  Gtk.Label(label="Repositories"))
-            notebook.append_page(self._build_claude_tab(),
-                                 Gtk.Label(label="Claude Code"))
+            notebook.append_page(self._build_ai_tab(),
+                                 Gtk.Label(label="AI"))
+            for pid in ("claude", "opencode", "codex", "gemini"):
+                notebook.append_page(self._build_ai_provider_tab(pid),
+                                     Gtk.Label(label=PROVIDERS[pid].label))
             self.get_content_area().pack_start(notebook, True, True, 0)
-            self.set_default_size(520, 520)
+            self.set_default_size(560, 560)
             self.show_all()
 
         def _build_general_tab(self):
@@ -2760,14 +3136,16 @@ def run_gui() -> int:
             outer.add(vbox)
             return outer
 
-        def _build_claude_tab(self):
+        def _build_ai_tab(self):
+            """Generic AI settings: primary/secondary provider, fallback, the
+            provider-agnostic run limits, and the worktree prompts (also
+            provider-agnostic — whichever provider runs them gets the same
+            English instructions)."""
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             vbox.set_border_width(12)
 
             def section(title):
                 lbl = Gtk.Label(xalign=0.0)
-                # markup_escape_text is mandatory: set_markup silently renders an
-                # empty label on invalid Pango XML (e.g. a bare & in a title string).
                 lbl.set_markup(f"<b>{GLib.markup_escape_text(title)}</b>")
                 vbox.pack_start(lbl, False, False, 0)
 
@@ -2787,24 +3165,6 @@ def run_gui() -> int:
                 vbox.pack_start(hbox, False, False, 0)
                 return spin
 
-            def combo_row(label_text, key, options, default, hint=None):
-                hbox = Gtk.Box(spacing=8)
-                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
-                hbox.pack_start(lbl, False, False, 0)
-                combo = Gtk.ComboBoxText()
-                for opt_id, opt_label in options:
-                    combo.append(opt_id, opt_label)
-                current = self._config.get(key, default)
-                if combo.set_active_id(current) is False:
-                    combo.set_active_id(default)
-                hbox.pack_start(combo, False, False, 0)
-                if hint:
-                    hl = Gtk.Label(label=hint, xalign=0.0)
-                    hl.get_style_context().add_class("dim-label")
-                    hbox.pack_start(hl, False, False, 0)
-                vbox.pack_start(hbox, False, False, 0)
-                return combo
-
             def prompt_row(label_text, key, default_text):
                 lbl = Gtk.Label(label=label_text, xalign=0.0)
                 vbox.pack_start(lbl, False, False, 0)
@@ -2820,28 +3180,58 @@ def run_gui() -> int:
                 vbox.pack_start(sw, True, True, 0)
                 return buf
 
-            # ── Commit ─────────────────────────────────────────────────────
-            section("Commit via Claude Code")
+            # ── Provider selection ────────────────────────────────────────
+            section("AI provider")
+
+            def provider_combo_row(label_text, key, allow_none, hint=None):
+                hbox = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
+                hbox.pack_start(lbl, False, False, 0)
+                combo = Gtk.ComboBoxText()
+                if allow_none:
+                    combo.append("", "(none)")
+                for pid in HEADLESS_PROVIDER_IDS:
+                    provider = PROVIDERS[pid]
+                    status = "✓ installed" if resolve_tool_bin(provider.bin_name) \
+                        else "not found"
+                    combo.append(pid, f"{provider.label} ({status})")
+                current = self._config.get(key, "")
+                if combo.set_active_id(current) is False:
+                    combo.set_active_id("" if allow_none else "claude")
+                hbox.pack_start(combo, False, False, 0)
+                if hint:
+                    hl = Gtk.Label(label=hint, xalign=0.0)
+                    hl.get_style_context().add_class("dim-label")
+                    hbox.pack_start(hl, False, False, 0)
+                vbox.pack_start(hbox, False, False, 0)
+                return combo
+
+            self._combo_ai_primary = provider_combo_row(
+                "Primary:", "ai_primary_provider", allow_none=False,
+                hint="does the work for Commit/Push/Explain actions")
+            self._combo_ai_secondary = provider_combo_row(
+                "Secondary (fallback):", "ai_secondary_provider", allow_none=True,
+                hint="tried once if the primary is missing or a run fails")
+            self._chk_ai_fallback = Gtk.CheckButton(
+                label="Fall back to the secondary provider on failure")
+            self._chk_ai_fallback.set_active(
+                self._config.get("ai_fallback_enabled", True))
+            vbox.pack_start(self._chk_ai_fallback, False, False, 0)
+
+            # ── Run limits (provider-agnostic) ────────────────────────────
+            section("Run limits")
             self._spin_commit_ram = spin_row(
                 "RAM/proc (MB):", "commit_ram_mb", 2048, 256, 65536, 256,
-                hint="RAM budgeted per claude process; workers = MemAvailable ÷ this")
+                hint="RAM budgeted per AI-provider process; workers = MemAvailable ÷ this")
             self._spin_commit_workers = spin_row(
                 "Max workers:", "commit_max_workers", 0, 0, 64, 1,
                 hint="0 = auto (RAM- and CPU-derived); >0 caps concurrency")
             self._spin_commit_timeout = spin_row(
                 "Timeout (s):", "commit_timeout", 3600, 30, 7200, 30,
-                hint="per-repo cap before a claude run is killed")
+                hint="per-repo cap before a run is killed")
             self._spin_commit_budget = spin_row(
                 "Budget ($/repo):", "commit_budget_usd", 10.0, 0, 1000, 1,
-                digits=2, hint="max claude spend per repo (0 = unbounded)")
-            self._combo_commit_model = combo_row(
-                "Model:", "commit_model",
-                [("sonnet", "Sonnet 5"), ("opus", "Opus")], "sonnet",
-                hint="model for headless commit/push runs")
-            self._combo_commit_effort = combo_row(
-                "Effort:", "commit_effort",
-                [("medium", "Medium"), ("high", "High")], "medium",
-                hint="reasoning effort for headless commit/push runs")
+                digits=2, hint="max spend per repo — only Claude Code supports this")
 
             # ── Prompts ────────────────────────────────────────────────────
             section("⏸  Idle worktree — close prompt")
@@ -2867,6 +3257,66 @@ def run_gui() -> int:
             outer.add(vbox)
             return outer
 
+        def _build_ai_provider_tab(self, pid):
+            """Model (and, if supported, effort) for one provider. Model is a
+            freeform-editable combo: the seed list is suggestions, not a
+            closed set (e.g. Claude Code can point at a DeepSeek/GLM endpoint
+            via ANTHROPIC_BASE_URL — any model string the provider accepts
+            is valid here)."""
+            provider = PROVIDERS[pid]
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            vbox.set_border_width(12)
+            widgets = {"model": None, "effort": None}
+
+            def combo_entry_row(label_text, key, options, hint=None):
+                hbox = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(label=label_text, xalign=1.0, width_chars=22)
+                hbox.pack_start(lbl, False, False, 0)
+                combo = Gtk.ComboBoxText.new_with_entry()
+                for opt_id, _opt_label in options:
+                    combo.append_text(opt_id)
+                current = self._config["ai_providers"].get(pid, {}).get(key, "")
+                combo.get_child().set_text(current)
+                hbox.pack_start(combo, False, False, 0)
+                if hint:
+                    hl = Gtk.Label(label=hint, xalign=0.0)
+                    hl.get_style_context().add_class("dim-label")
+                    hbox.pack_start(hl, False, False, 0)
+                vbox.pack_start(hbox, False, False, 0)
+                return combo
+
+            if not provider.headless:
+                note = Gtk.Label(
+                    xalign=0.0, wrap=True,
+                    label=f"{provider.label} isn't wired for headless "
+                          "Commit/Push/Explain yet — its JSON output format "
+                          "isn't confirmed stable. You can still use "
+                          f"“Open {provider.label}” for an "
+                          "interactive session.")
+                note.get_style_context().add_class("dim-label")
+                vbox.pack_start(note, False, False, 0)
+
+            widgets["model"] = combo_entry_row(
+                "Model:", "model", provider.model_options,
+                hint="freeform — pick a suggestion or type any model name/id")
+            if provider.effort_options:
+                widgets["effort"] = combo_entry_row(
+                    "Effort:", "effort", provider.effort_options,
+                    hint="reasoning effort for headless runs")
+            if not provider.supports_budget:
+                hint = Gtk.Label(
+                    xalign=0.0,
+                    label="No cost-budget flag for this provider — only the "
+                          "AI tab's timeout applies.")
+                hint.get_style_context().add_class("dim-label")
+                vbox.pack_start(hint, False, False, 0)
+
+            self._provider_widgets[pid] = widgets
+            outer = Gtk.ScrolledWindow()
+            outer.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            outer.add(vbox)
+            return outer
+
         def get_config(self) -> dict:
             cfg = dict(self._config)
             cfg["base_dir"] = self._entry_base.get_text().strip()
@@ -2879,10 +3329,20 @@ def run_gui() -> int:
             cfg["commit_timeout"] = int(self._spin_commit_timeout.get_value())
             cfg["commit_budget_usd"] = round(
                 self._spin_commit_budget.get_value(), 2)
-            cfg["commit_model"] = (
-                self._combo_commit_model.get_active_id() or "sonnet")
-            cfg["commit_effort"] = (
-                self._combo_commit_effort.get_active_id() or "medium")
+            cfg["ai_primary_provider"] = (
+                self._combo_ai_primary.get_active_id() or "claude")
+            cfg["ai_secondary_provider"] = self._combo_ai_secondary.get_active_id() or ""
+            cfg["ai_fallback_enabled"] = self._chk_ai_fallback.get_active()
+            ai_providers = {pid: dict(vals) for pid, vals
+                           in self._config.get("ai_providers", {}).items()}
+            for pid, widgets in self._provider_widgets.items():
+                entry = dict(ai_providers.get(pid, {}))
+                if widgets.get("model") is not None:
+                    entry["model"] = widgets["model"].get_child().get_text().strip()
+                if widgets.get("effort") is not None:
+                    entry["effort"] = widgets["effort"].get_child().get_text().strip()
+                ai_providers[pid] = entry
+            cfg["ai_providers"] = ai_providers
             cfg["show_stale_worktrees"] = self._chk_show_stale.get_active()
             cfg["stale_worktree_idle_hours"] = int(self._spin_idle_hours.get_value())
             cfg["stale_worktree_stuck_hours"] = int(self._spin_stuck_hours.get_value())
@@ -2916,42 +3376,48 @@ def run_gui() -> int:
             ("p", "Repos with uncommitted changes appear first, marked with ●."),
             ("item", "Open terminal",
              "Opens a terminal in the repo directory."),
-            ("item", "Open Claude Code",
-             "Opens Claude Code interactively in a terminal."),
+            ("item", "Open <AI provider>",
+             "Opens your configured primary AI CLI (Claude Code, OpenCode, "
+             "Codex, or Gemini CLI) interactively in a terminal."),
             ("item", "git commit (N)",
              "Opens a terminal with your editor so you can write the commit "
              "message yourself. Good for quick, focused commits."),
-            ("item", "Commit via Claude Code…",
-             "Claude Code inspects the diff, groups changes into logical commits "
-             "with appropriate messages, fixes any pre-commit hook failures, then "
-             "optionally merges the branch into main. A progress dialog shows "
-             "per-repo status."),
+            ("item", "Commit via <AI provider>…",
+             "Your primary AI provider inspects the diff, groups changes into "
+             "logical commits with appropriate messages, fixes any pre-commit "
+             "hook failures, then optionally merges the branch into main. If "
+             "it's missing or the run fails, a configured secondary provider "
+             "is tried once — only after re-checking the repo shows work "
+             "genuinely remains, so a fallback never double-commits. A "
+             "progress dialog shows per-repo status."),
             ("h2", "Unpushed repos"),
             ("p", "Repos with local commits not yet on a remote appear in the "
                   "Unpushed section."),
             ("item", "git push",
              "Opens a terminal and runs git push. Use this when you need to "
              "enter a passphrase or watch the output interactively."),
-            ("item", "Push via Claude Code…",
-             "Claude Code runs git push, handles non-fast-forward divergence "
-             "(pull --rebase + retry), and fixes pre-push hook failures. Use "
-             "when a plain push fails and you want errors fixed automatically."),
+            ("item", "Push via <AI provider>…",
+             "Your primary AI provider runs git push, handles non-fast-forward "
+             "divergence (pull --rebase + retry), and fixes pre-push hook "
+             "failures — with the same safe fallback-to-secondary behavior as "
+             "Commit. Use when a plain push fails and you want errors fixed "
+             "automatically."),
             ("h2", "Stale worktrees"),
             ("p", "Extra git worktrees (from git worktree add) that have gone "
                   "quiet appear as ⚠ Stuck or ⏸ Idle sections."),
             ("item", "⚠ Stuck",
              "A worktree with uncommitted changes sitting idle longer than the "
-             "configured threshold. Use “Finish & merge via Claude Code” "
+             "configured threshold. Use “Finish & merge via <AI provider>” "
              "to commit, merge into main, and remove the worktree automatically."),
             ("item", "⏸ Idle",
              "A clean worktree with no ahead commits sitting idle. Use "
-             "“Close via Claude Code” to review and remove it, or "
+             "“Close via <AI provider>” to review and remove it, or "
              "“Remove worktree” for an immediate direct delete."),
             ("h2", "Dashboard"),
             ("p", "Lists every repo with full status. Open with "
                   "“Show dashboard…” or by re-launching the tray. "
-                  "Each row has buttons for Terminal, Claude Code, Push, GitHub, "
-                  "and Open folder."),
+                  "Each row has buttons for Terminal, your AI provider, Push, "
+                  "GitHub, and Open folder."),
             ("h2", "Settings"),
             ("item", "General",
              "Scan root directory, depth, refresh interval, terminal."),
@@ -2959,12 +3425,22 @@ def run_gui() -> int:
              "Show/hide remoteless repos; stale-worktree thresholds."),
             ("item", "Repositories",
              "Per-repo include/exclude list. Rescan after changing the root."),
-            ("item", "Claude Code",
-             "RAM/worker/timeout/budget limits, model (Sonnet 5 / Opus) and "
-             "effort (Medium / High) for headless Claude commit/push runs; "
-             "customisable prompts for worktree close and finish actions. "
+            ("item", "AI",
+             "Pick a primary AI CLI provider (Claude Code, OpenCode, Codex — "
+             "each shown with its install status) and an optional secondary "
+             "tried once as a fallback if the primary is missing or a run "
+             "fails/times out. Also holds the provider-agnostic run limits "
+             "(RAM/worker/timeout/budget — budget only applies to Claude "
+             "Code) and the customisable worktree close/finish prompts. "
              "Placeholders {path}, {branch}, {repo_path} are substituted at "
              "runtime."),
+            ("item", "Claude Code / OpenCode / Codex / Gemini",
+             "Model and (where the provider supports it) reasoning-effort "
+             "level for that provider's headless runs. Model is freeform — "
+             "type any model name/id the provider accepts, e.g. a DeepSeek or "
+             "GLM endpoint via Claude Code's ANTHROPIC_BASE_URL. Gemini CLI "
+             "is detected and launchable interactively but not yet wired for "
+             "headless Commit/Push/Explain."),
         ]
 
         def __init__(self, parent):

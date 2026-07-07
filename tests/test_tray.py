@@ -1658,5 +1658,293 @@ class RunCheckTest(unittest.TestCase):
         self.assertIn("(none found", out)
 
 
+class ProviderRegistryTest(unittest.TestCase):
+    def test_claude_build_argv_commit_json(self):
+        argv = tray.PROVIDERS["claude"].build_argv(
+            "/x/claude", "commit", "json", 10.0, "opus", "high")
+        self.assertIn("--max-budget-usd", argv)
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "opus")
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertEqual(argv[argv.index("-p") + 1], tray.COMMIT_PROMPT)
+
+    def test_claude_build_argv_push_stream(self):
+        argv = tray.PROVIDERS["claude"].build_argv(
+            "/x/claude", "push", "stream-json", 0, "", "")
+        self.assertIn("stream-json", argv)
+        self.assertNotIn("--max-budget-usd", argv)
+        self.assertEqual(argv[argv.index("-p") + 1], tray.PUSH_PROMPT)
+
+    def test_claude_build_argv_unknown_task_raises(self):
+        with self.assertRaises(ValueError):
+            tray.PROVIDERS["claude"].build_argv(
+                "/x/claude", "bogus", "json", 0, "", "")
+
+    def test_opencode_build_argv_omits_budget_and_effort(self):
+        argv = tray.PROVIDERS["opencode"].build_argv(
+            "/x/opencode", "commit", "stream-json", 10.0,
+            "anthropic/claude-sonnet-5", "high")
+        self.assertEqual(argv[0], "/x/opencode")
+        self.assertIn("run", argv)
+        self.assertIn("--auto", argv)
+        self.assertNotIn("--max-budget-usd", argv)
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1],
+                         "anthropic/claude-sonnet-5")
+        self.assertNotIn("--effort", argv)
+
+    def test_opencode_build_argv_omits_model_flag_when_empty(self):
+        argv = tray.PROVIDERS["opencode"].build_argv(
+            "/x/opencode", "push", "stream-json", 0, "", "")
+        self.assertNotIn("--model", argv)
+
+    def test_codex_build_argv_includes_effort_flag(self):
+        argv = tray.PROVIDERS["codex"].build_argv(
+            "/x/codex", "commit", "stream-json", 10.0, "gpt-5.5", "high")
+        self.assertEqual(argv[0], "/x/codex")
+        self.assertIn("exec", argv)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertNotIn("--max-budget-usd", argv)
+        self.assertIn("--model", argv)
+        self.assertIn("-c", argv)
+        self.assertIn("model_reasoning_effort=high", argv)
+
+    def test_codex_build_argv_omits_effort_flag_when_empty(self):
+        argv = tray.PROVIDERS["codex"].build_argv(
+            "/x/codex", "push", "stream-json", 0, "", "")
+        self.assertNotIn("-c", argv)
+
+    def test_gemini_not_headless(self):
+        self.assertFalse(tray.PROVIDERS["gemini"].headless)
+
+    def test_headless_provider_ids_excludes_gemini(self):
+        self.assertIn("claude", tray.HEADLESS_PROVIDER_IDS)
+        self.assertIn("opencode", tray.HEADLESS_PROVIDER_IDS)
+        self.assertIn("codex", tray.HEADLESS_PROVIDER_IDS)
+        self.assertNotIn("gemini", tray.HEADLESS_PROVIDER_IDS)
+
+    def test_resolve_tool_bin_delegates_to_shutil_which(self):
+        orig = tray.shutil.which
+        tray.shutil.which = lambda name: f"/fake/{name}"
+        try:
+            self.assertEqual(tray.resolve_tool_bin("opencode"), "/fake/opencode")
+        finally:
+            tray.shutil.which = orig
+
+    def test_fmt_stream_event_generic_passthrough_on_non_json(self):
+        self.assertEqual(tray._fmt_stream_event_generic("plain text"), "plain text")
+
+    def test_fmt_stream_event_generic_extracts_result_field(self):
+        line = json.dumps({"result": "did the thing"})
+        self.assertEqual(tray._fmt_stream_event_generic(line), "did the thing\n")
+
+    def test_fmt_stream_event_generic_skips_unrecognized_json(self):
+        line = json.dumps({"type": "system", "foo": "bar"})
+        self.assertEqual(tray._fmt_stream_event_generic(line), "")
+
+    def test_extract_result_generic_checks_result_text_message(self):
+        self.assertEqual(
+            tray._extract_result_generic(json.dumps({"text": "hi"})), "hi")
+        self.assertIsNone(tray._extract_result_generic("not json"))
+        self.assertIsNone(tray._extract_result_generic(json.dumps([1, 2, 3])))
+
+
+class ProviderSelectionTest(unittest.TestCase):
+    def test_defaults_to_claude_primary_no_secondary(self):
+        sel = tray.provider_selection(tray.CONFIG_DEFAULTS)
+        self.assertEqual(sel["primary"], "claude")
+        self.assertEqual(sel["secondary"], "")
+        self.assertTrue(sel["fallback_enabled"])
+
+    def test_secondary_equal_to_primary_collapses_to_none(self):
+        cfg = dict(tray.CONFIG_DEFAULTS)
+        cfg["ai_primary_provider"] = "opencode"
+        cfg["ai_secondary_provider"] = "opencode"
+        sel = tray.provider_selection(cfg)
+        self.assertEqual(sel["secondary"], "")
+
+    def test_distinct_secondary_is_kept(self):
+        cfg = dict(tray.CONFIG_DEFAULTS)
+        cfg["ai_primary_provider"] = "claude"
+        cfg["ai_secondary_provider"] = "opencode"
+        sel = tray.provider_selection(cfg)
+        self.assertEqual(sel["secondary"], "opencode")
+
+    def test_models_and_efforts_resolved_per_provider(self):
+        cfg = dict(tray.CONFIG_DEFAULTS)
+        cfg["ai_providers"] = {"claude": {"model": "opus", "effort": "high"}}
+        sel = tray.provider_selection(cfg)
+        self.assertEqual(sel["models"]["claude"], "opus")
+        self.assertEqual(sel["efforts"]["claude"], "high")
+        self.assertEqual(sel["models"]["opencode"], "")
+
+
+class ConfigMigrationTest(unittest.TestCase):
+    def setUp(self):
+        self._xdg = os.environ.get("XDG_CONFIG_HOME")
+        self._tmp = tempfile.mkdtemp(prefix="repodash-aimigrate-")
+        os.environ["XDG_CONFIG_HOME"] = self._tmp
+
+    def tearDown(self):
+        if self._xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._xdg
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write_raw_config(self, data):
+        path = tray.config_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def test_legacy_commit_model_effort_migrate_to_claude_provider(self):
+        self._write_raw_config({"commit_model": "opus", "commit_effort": "high"})
+        cfg = tray.load_config()
+        self.assertEqual(cfg["ai_providers"]["claude"]["model"], "opus")
+        self.assertEqual(cfg["ai_providers"]["claude"]["effort"], "high")
+
+    def test_legacy_keys_do_not_override_explicit_ai_providers(self):
+        self._write_raw_config({
+            "commit_model": "opus", "commit_effort": "high",
+            "ai_providers": {"claude": {"model": "sonnet", "effort": "medium"}},
+        })
+        cfg = tray.load_config()
+        self.assertEqual(cfg["ai_providers"]["claude"]["model"], "sonnet")
+        self.assertEqual(cfg["ai_providers"]["claude"]["effort"], "medium")
+
+    def test_missing_provider_id_backfilled_from_defaults(self):
+        self._write_raw_config(
+            {"ai_providers": {"claude": {"model": "opus", "effort": "high"}}})
+        cfg = tray.load_config()
+        self.assertIn("opencode", cfg["ai_providers"])
+        self.assertIn("codex", cfg["ai_providers"])
+        self.assertIn("gemini", cfg["ai_providers"])
+        self.assertEqual(cfg["ai_providers"]["claude"]["model"], "opus")
+
+    def test_no_saved_config_uses_full_defaults(self):
+        cfg = tray.load_config()
+        self.assertEqual(set(cfg["ai_providers"].keys()),
+                         set(tray.CONFIG_DEFAULTS["ai_providers"].keys()))
+        self.assertEqual(cfg["ai_primary_provider"], "claude")
+        self.assertEqual(cfg["ai_secondary_provider"], "")
+        self.assertTrue(cfg["ai_fallback_enabled"])
+
+
+class RepoOpGateTest(unittest.TestCase):
+    def test_git_op_in_progress_detects_all_markers(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, ".git"))
+            self.assertFalse(tray._git_op_in_progress(d))
+            for marker in ("rebase-merge", "rebase-apply"):
+                mpath = os.path.join(d, ".git", marker)
+                os.makedirs(mpath)
+                self.assertTrue(tray._git_op_in_progress(d))
+                os.rmdir(mpath)
+            for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD"):
+                mpath = os.path.join(d, ".git", marker)
+                open(mpath, "w").close()
+                self.assertTrue(tray._git_op_in_progress(d))
+                os.remove(mpath)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_commit_task_retries_when_still_dirty(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            with open(os.path.join(repo, "new.txt"), "w") as f:
+                f.write("x")
+            self.assertEqual(tray._repo_op_gate(repo, "commit"), "retry")
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_commit_task_ok_in_effect_when_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            self.assertEqual(tray._repo_op_gate(repo, "commit"), "ok_in_effect")
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_push_task_retries_when_unpushed_remain(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            self.assertEqual(tray._repo_op_gate(work, "push"), "retry")
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_push_task_ok_in_effect_when_fully_pushed(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = _clone_of_bare(d)
+            _commit(work)
+            subprocess.run(["git", "-C", work, "push", "-u", "origin", "HEAD"],
+                           check=True, capture_output=True)
+            self.assertEqual(tray._repo_op_gate(work, "push"), "ok_in_effect")
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_needs_attention_when_rebase_in_progress(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = os.path.join(d, "r")
+            _init_repo(repo)
+            _commit(repo)
+            os.makedirs(os.path.join(repo, ".git", "rebase-merge"))
+            self.assertEqual(tray._repo_op_gate(repo, "commit"), "needs_attention")
+            self.assertEqual(tray._repo_op_gate(repo, "push"), "needs_attention")
+
+
+class ProviderTerminalTest(unittest.TestCase):
+    def test_open_provider_terminal_uses_provider_interactive_cmd(self):
+        seen = {}
+        orig = tray.open_terminal
+
+        def fake(path, command=None):
+            seen["path"] = path
+            seen["command"] = command
+            return True, None
+
+        tray.open_terminal = fake
+        try:
+            ok, _ = tray.open_provider_terminal("/x", "opencode")
+        finally:
+            tray.open_terminal = orig
+        self.assertTrue(ok)
+        self.assertEqual(seen["command"], tray.PROVIDERS["opencode"].interactive_cmd)
+
+    def test_open_wt_provider_missing_binary_message_uses_bin_name(self):
+        orig = tray.shutil.which
+        tray.shutil.which = lambda _: None
+        try:
+            ok, msg = tray.open_wt_provider("/x", "prompt", "opencode")
+        finally:
+            tray.shutil.which = orig
+        self.assertFalse(ok)
+        self.assertIn("opencode not found", msg)
+
+    def test_open_wt_provider_gemini_not_headless(self):
+        ok, msg = tray.open_wt_provider("/x", "prompt", "gemini")
+        self.assertFalse(ok)
+        self.assertIn("does not support", msg)
+
+    def test_open_wt_provider_success_delegates_to_open_terminal(self):
+        orig_which = tray.shutil.which
+        orig_terminal = tray.open_terminal
+        tray.shutil.which = lambda _: "/usr/bin/opencode"
+        seen = {}
+
+        def fake(path, command=None):
+            seen["command"] = command
+            return True, None
+
+        tray.open_terminal = fake
+        try:
+            ok, _ = tray.open_wt_provider("/x", "do the thing", "opencode")
+        finally:
+            tray.shutil.which = orig_which
+            tray.open_terminal = orig_terminal
+        self.assertTrue(ok)
+        self.assertIn("do the thing", seen["command"])
+
+
 if __name__ == "__main__":
     unittest.main()
