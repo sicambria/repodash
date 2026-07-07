@@ -1704,8 +1704,7 @@ def run_gui() -> int:
                          lambda *_: self.show_dashboard())
             self._action(menu, "Refresh now", lambda *_: self.refresh_menu())
             self._action(menu, "Settings…", lambda *_: self._on_settings())
-            self._action(menu, "Help…", lambda *_: self._on_help())
-            self._action(menu, "About…", lambda *_: self._on_about())
+            self._action(menu, "Help & About…", lambda *_: self._on_help())
 
             start_item = Gtk.CheckMenuItem(label="Start on login")
             start_item.set_active(autostart_enabled())  # set before connecting
@@ -1928,40 +1927,6 @@ def run_gui() -> int:
                     "from being shown. The error has been printed to the "
                     "terminal.")
 
-        def _on_about(self):
-            parent = self.window if (self.window and self.window.get_visible()) else None
-            try:
-                dlg = Gtk.AboutDialog(transient_for=parent, modal=True)
-                dlg.set_program_name("repodash")
-                dlg.set_version(VERSION)
-                dlg.set_comments(
-                    "A tray companion for your git repositories.\n"
-                    "Monitors dirty repos, unpushed commits, and stale\n"
-                    "worktrees — and launches AI CLI actions (Claude Code,\n"
-                    "OpenCode, Codex) from the menu."
-                )
-                dlg.set_copyright("© 2026 repodash contributors")
-                dlg.set_license_type(Gtk.License.GPL_3_0)
-                dlg.set_authors(["repodash contributors"])
-                dlg.set_website("https://github.com/sicambria/repodash")
-                dlg.set_website_label("github.com/sicambria/repodash")
-                if os.path.isfile(ICON_SVG):
-                    try:
-                        from gi.repository import GdkPixbuf
-                        pb = GdkPixbuf.Pixbuf.new_from_file_at_size(ICON_SVG, 64, 64)
-                        dlg.set_logo(pb)
-                    except Exception:
-                        pass
-                dlg.run()
-                dlg.destroy()
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                self._show_error(
-                    "About could not be opened",
-                    "A bug in the about dialog construction prevented it "
-                    "from being shown. The error has been printed to the "
-                    "terminal.")
 
         def _ai_label(self):
             pid = self.config.get("ai_primary_provider", "claude")
@@ -3567,7 +3532,15 @@ def run_gui() -> int:
 
     class HelpDialog(Gtk.Dialog):
         _CONTENT = [
-            ("h", "repodash Workflow Guide"),
+            ("h", "About repodash"),
+            ("p", "version " + VERSION),
+            ("p", "A tray companion for your git repositories. "
+                  "Monitors dirty repos, unpushed commits, and stale "
+                  "worktrees — and launches AI CLI actions (Claude Code, "
+                  "OpenCode, Codex) from the menu."),
+            ("p", "© 2026 repodash contributors"),
+            ("p", "Licensed under GPL 3.0"),
+            ("h2", "Workflow Guide"),
             ("p", "repodash watches your git repos and surfaces work that needs "
                   "attention. The tray icon shows a count of dirty repos; click "
                   "an entry to act on it."),
@@ -3692,6 +3665,15 @@ def run_gui() -> int:
 
             scroller.add(tv)
             area.pack_start(scroller, True, True, 0)
+
+            link = Gtk.LinkButton.new_with_label(
+                "https://github.com/sicambria/repodash",
+                "repodash on GitHub")
+            link.set_halign(Gtk.Align.START)
+            link.set_margin_start(16)
+            link.set_margin_bottom(8)
+            area.pack_start(link, False, False, 0)
+
             self.show_all()
 
     app = TrayApp()
