@@ -13,17 +13,32 @@ no GTK4 binding).
 ## What it does
 
 **Tray menu** (refreshes every ~90s, cheaply — just `git status` per repo):
-- header line: `N dirty · M repos` (+ a count badge on the icon);
-- one submenu per dirty repo → **Open terminal**, **Open Claude Code**
-  (`claude --dangerously-skip-permissions`), **Open GitHub** (if an `origin`
-  GitHub remote exists), **Open folder**, **Copy path**;
-- **Show dashboard…**, **Refresh now**, **Quit**.
+- header line: `N dirty · N unpushed · N repos` (+ a count badge on the icon);
+- **Dirty repos** — per-repo submenu with:
+  - **Open terminal**, **Open [AI provider]** (Claude Code / OpenCode / Codex / Gemini)
+  - **Explain changes…** — read-only AI analysis of uncommitted changes
+  - **git commit**, **Commit via [AI provider]…** — headless AI commit
+  - **git push**, **Push via [AI provider]…** — headless AI push
+  - **Open GitHub** (if an `origin` GitHub remote exists), **Open folder**, **Copy path**
+  - **Commit all via [AI provider]…** — batch-commit all dirty repos
+- **Unpushed repos** section — repos with commits not yet pushed, with per-repo push actions, batch **Push all** and **Push all via [AI provider]**
+- **Stale worktrees** — **⚠ Stuck** (dirty, git stash needed), **⏸ Idle** (no recent activity), **✓ Merged** (absorbed but not deleted); each with AI-managed workflow actions
+- **Show dashboard…**, **Settings…**, **Help & About…**, **Refresh now**, **Start on login** (toggle autostart), **Quit**
 
 **Dashboard window** (full scan on demand — runs `repodash.py --json`):
 - every repo with branch / ahead-behind / changed-file / TODO / audit / roadmap /
   sonar summary;
-- a search box and **Dirty only** / **Has TODOs** filters;
-- the same per-repo action buttons.
+- a search box and **Dirty only** / **Has TODOs** / **Unpushed repos** filters;
+- per-repo action buttons mirroring the tray submenu.
+
+**Settings dialog** (multi-provider AI config):
+- Scan root, depth, refresh interval, excluded repos, terminal override, remote filtering
+- AI provider: primary / secondary / fallback, with per-provider model, effort, RAM budget, worker limits, and spend cap (Claude only)
+- Supported providers: Claude Code, OpenCode, Codex CLI, Gemini CLI
+
+**Explain changes** dialog:
+- Read-only: shows AI analysis of `git diff` / `git diff --staged` in the AI provider's terminal
+- One-click follow-up: commit or commit & push, gated on detection of changes
 
 ## Install
 
@@ -106,8 +121,9 @@ python3 tray/repodash_tray.py --check
 ```
 
 It prints the scan root, the resolved terminal command (and the exact argv it
-would run for a terminal and for Claude Code), and every dirty repo with its
-branch, change count, and GitHub URL.
+would run for a terminal and for each configured AI provider), every dirty and
+unpushed repo with its branch and change count, GitHub URL, stale worktrees
+(stuck/idle/merged) with ages, AI provider version detection, and autostart state.
 
 ## Troubleshooting
 

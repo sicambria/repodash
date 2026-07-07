@@ -42,7 +42,7 @@ With no arguments it scans `$HOME/git`. Pass a directory to scan a different roo
 |---|---|
 | `--git` `--todos` `--audit` `--roadmap` `--sonar` | show only those sections (combinable) |
 | `--dirty` | only show repos with something to report |
-| `--json` | emit the full model as JSON (ignores section flags) |
+| `--json` | emit the full model as JSON (ignores section flags and `--dirty`) |
 | `--no-color` | disable ANSI color |
 | `--insecure` | skip TLS verification for the Sonar request |
 | `--depth N` | repo-discovery depth (default 3) |
@@ -118,11 +118,21 @@ Top-level object (stable; `schema_version` bumps only on breaking changes). The 
 }
 ```
 
-Rules: every section key is always present (empty arrays / `null`, never omitted); Sonar metrics are JSON numbers; `sonar.configured: false` (no properties file) is distinct from `configured: true, ok: false, error: "…"`. `sonar.onboarding` is always present: `optout_reason` is the first line of a `.sonar-optout` marker, or `null` when there is none.
+Rules: every section key is always present (empty arrays / `null`, never omitted); Sonar metrics are JSON numbers; the full metric set is `bugs`, `vulnerabilities`, `code_smells`, `coverage`, `duplicated_lines_density`, `security_hotspots`. `sonar.configured: false` (no properties file) is distinct from `configured: true, ok: false, error: "…"`. `sonar.onboarding` is always present: `optout_reason` is the first line of a `.sonar-optout` marker, or `null` when there is none.
 
 ## GNOME tray (Linux)
 
-An optional tray-icon companion lives in [`tray/`](tray/README.md). On Ubuntu 26.04 / GNOME it puts an indicator in the top bar whose menu lists only repos with a dirty working tree — each with one-click **open terminal**, **open Claude Code** (`claude --dangerously-skip-permissions`), **open GitHub**, **open folder**, and **copy path** — plus a searchable/filterable dashboard window of every repo's status. It is a pure consumer of `repodash.py --json` (the cross-platform core is untouched and stays dependency-free); the tray itself needs GTK3 + PyGObject and is Linux-only. See [`tray/README.md`](tray/README.md) for install and autostart.
+An optional tray-icon companion lives in [`tray/`](tray/README.md). On Ubuntu 26.04 / GNOME it puts an indicator in the top bar whose menu shows:
+
+- **Dirty repos** — per-repo submenu with one-click **open terminal**, **open [AI provider]** (Claude Code / OpenCode / Codex / Gemini), **Explain changes**, **git commit / Commit via AI**, **git push / Push via AI**, **open GitHub**, **open folder**, and **copy path**. Also batch-commit all dirty repos.
+- **Unpushed repos** — repos with commits that haven't been pushed yet, with per-repo push actions and batch-push-all.
+- **Stale worktrees** — stuck (dirty), idle (no recent activity), and merged (absorbed but not deleted) worktrees, each with AI-managed workflow actions (finish, close, delete).
+- **Searchable/filterable dashboard window** — every repo's status, branch, ahead/behind, changed files, TODOs, audit items, roadmap items, and Sonar stats in a GTK ListBox.
+- **Settings dialog** — configurable scan root, depth, refresh interval, excluded repos, terminal override, remote filtering, and multi-provider AI (primary/secondary/fallback with per-provider model, effort, RAM budget, worker limits, and spend cap).
+- **Autostart** — toggle login autostart from the tray menu.
+- **`--check` mode** — headless summary of dirty, unpushed, and stale worktree repos plus AI provider detection.
+
+It is a pure consumer of `repodash.py --json` (the cross-platform core is untouched and stays dependency-free); the tray itself needs GTK3 + PyGObject and is Linux-only. See [`tray/README.md`](tray/README.md) for install and autostart.
 
 ## Platform notes
 
