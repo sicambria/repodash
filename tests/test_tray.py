@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Unit tests for the tray app's pure helpers (no GTK / no `gi` needed).
 
-The GUI layer keeps all ``gi`` imports inside ``run_gui()``, so the module
-imports cleanly here and we can test the data/action helpers in isolation.
+The pure functions live in ``repodash_tray_core.py`` — this test file loads
+that module directly so monkey-patches on ``tray._x`` affect the correct
+namespace. The GUI layer keeps all ``gi`` imports inside ``run_gui()``.
 Git-backed tests skip when git is unavailable; everything else always runs.
 """
 import contextlib
@@ -18,12 +19,13 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TRAY_PY = os.path.join(ROOT, "tray", "repodash_tray.py")
+TRAY_PY = os.path.join(ROOT, "tray", "repodash_tray_core.py")
+TRAY_GUI_PY = os.path.join(ROOT, "tray", "repodash_tray.py")
 HAVE_GIT = shutil.which("git") is not None
 
 
 def _load_tray():
-    spec = importlib.util.spec_from_file_location("repodash_tray", TRAY_PY)
+    spec = importlib.util.spec_from_file_location("repodash_tray_core", TRAY_PY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -710,7 +712,7 @@ class MarkupSafetyTest(unittest.TestCase):
     """
 
     def _source(self):
-        with open(TRAY_PY, encoding="utf-8") as f:
+        with open(TRAY_GUI_PY, encoding="utf-8") as f:
             return f.read()
 
     def test_section_helpers_escape_title(self):
@@ -721,11 +723,11 @@ class MarkupSafetyTest(unittest.TestCase):
         unsafe = re.compile(r'set_markup\(\s*f"<b>\{(?!GLib\.markup_escape_text)')
         self.assertGreaterEqual(
             source.count(safe), 2,
-            f"expected ≥2 escaped section() set_markup calls in {TRAY_PY}")
+            f"expected ≥2 escaped section() set_markup calls in {TRAY_GUI_PY}")
         bad = unsafe.findall(source)
         self.assertEqual(
             bad, [],
-            f"unescaped set_markup interpolation found in {TRAY_PY}: {bad}")
+            f"unescaped set_markup interpolation found in {TRAY_GUI_PY}: {bad}")
 
     def test_ampersand_title_still_present(self):
         """At least one section() call must have & in its title string.
