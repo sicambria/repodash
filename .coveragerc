@@ -1,0 +1,19 @@
+[run]
+source =
+    repodash
+
+omit =
+    .venv/*
+    */__pycache__/*
+    /usr/*
+    tests/*
+    tray/*
+
+[report]
+# Lines below are never expected to execute during headless tests.
+exclude_also =
+    def _enable_windows_vt\(
+    if __name__ == "__main__":
+
+[html]
+directory = htmlcov

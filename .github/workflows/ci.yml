@@ -21,6 +21,22 @@ jobs:
       - name: Run test suite
         run: python -m unittest discover -s tests -v
 
+  # Coverage gate: enforces the same >=80% threshold as the local pre-push hook.
+  # Ubuntu only (coverage.py is cross-platform, but one OS is enough to flag drift).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install coverage
+        run: pip install coverage
+      - name: Run test suite with coverage
+        run: |
+          python -m coverage run -m unittest discover tests -v
+          python -m coverage report --fail-under=80
+
   # Bash implementation + the JSON parity gate (Unix only).
   bash-parity:
     runs-on: ubuntu-latest

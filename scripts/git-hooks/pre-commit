@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# repodash pre-commit gate: test suite + bash syntax check.
+# Fast enough for every commit (~7s). Parity gate and coverage threshold live
+# in pre-push (slower, requires venv + network-dependent parity).
+#
+# Installed via scripts/install-hooks.sh (sets core.hooksPath). To bypass in
+# an emergency: git commit --no-verify.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+# git commit sets GIT_INDEX_FILE to a temporary index path, which can confuse
+# tests that create their own git repos (worktree tests, clone-from-bare tests).
+# Clear git env vars inherited from the outer commit so the test repos are
+# fully isolated.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY
+
+echo "==> pre-commit: running full test suite"
+python3 -m unittest discover tests -v
+
+echo "==> pre-commit: bash syntax check"
+bash -n repodash
+
+echo "==> pre-commit: all checks passed"

@@ -10,8 +10,8 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 zero_sha="0000000000000000000000000000000000000000"
 
-echo "==> pre-push: running full test suite"
-python3 -m unittest discover tests
+echo "==> pre-push: running full test suite with coverage threshold"
+bash scripts/test_with_coverage.sh
 
 echo "==> pre-push: bash syntax check"
 bash -n repodash
