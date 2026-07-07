@@ -549,7 +549,7 @@ def terminal_argv(term: str, cwd: str, command=None):
     name = os.path.basename(term)
     if sys.platform == "win32":
         if name in ("wt", "wt.exe"):
-            argv = ["wt", "-d", cwd]
+            argv = [term, "-d", cwd]
             if command:
                 argv += ["cmd", "/k", command]
             return argv
@@ -557,12 +557,12 @@ def terminal_argv(term: str, cwd: str, command=None):
             cmd_line = f'cd /d "{cwd}"'
             if command:
                 cmd_line += f" && {command}"
-            return ["cmd", "/k", cmd_line]
+            return [term, "/k", cmd_line]
         if name in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
             ps_cmd = f"Set-Location '{cwd}'"
             if command:
                 ps_cmd += f"; {command}"
-            return ["powershell", "-NoExit", "-Command", ps_cmd]
+            return [term, "-NoExit", "-Command", ps_cmd]
         raise ValueError(f"unsupported terminal: {term}")
     if name == "ptyxis":
         argv = [term, "--new-window", "-d", cwd]

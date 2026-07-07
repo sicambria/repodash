@@ -2231,5 +2231,236 @@ class ModelEffortArgsTest(unittest.TestCase):
         self.assertEqual(tray._model_effort_args("", ""), [])
 
 
+# ── Windows-specific tests ────────────────────────────────────────────────────
+class WindowsTerminalTest(unittest.TestCase):
+    def test_wt_terminal(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("wt", r"C:\Users\test")
+            self.assertEqual(argv, ["wt", "-d", r"C:\Users\test"])
+
+    def test_wt_terminal_with_command(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("wt", r"C:\Users\test", "echo hello")
+            self.assertEqual(argv, ["wt", "-d", r"C:\Users\test",
+                                     "cmd", "/k", "echo hello"])
+
+    def test_cmd_terminal(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("cmd", r"C:\Users\test")
+            self.assertEqual(argv, ["cmd", "/k", 'cd /d "C:\\Users\\test"'])
+
+    def test_cmd_terminal_with_command(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("cmd", r"C:\Users\test", "echo hello")
+            self.assertEqual(argv, ["cmd", "/k",
+                                     'cd /d "C:\\Users\\test" && echo hello'])
+
+    def test_powershell_terminal(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("powershell", r"C:\Users\test")
+            self.assertEqual(argv, ["powershell", "-NoExit",
+                                     "-Command", "Set-Location 'C:\\Users\\test'"])
+
+    def test_powershell_terminal_with_command(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("powershell", r"C:\Users\test",
+                                       "echo hello")
+            self.assertEqual(argv, ["powershell", "-NoExit", "-Command",
+                                     "Set-Location 'C:\\Users\\test'; echo hello"])
+
+    def test_pwsh_terminal(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("pwsh", r"C:\Users\test")
+            self.assertEqual(argv, ["pwsh", "-NoExit",
+                                     "-Command", "Set-Location 'C:\\Users\\test'"])
+
+    def test_unknown_windows_terminal_raises(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with self.assertRaises(ValueError):
+                tray.terminal_argv("konsole", r"C:\Users\test")
+
+    def test_absolute_wt_path_uses_basename(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            argv = tray.terminal_argv("C:/Tools/wt.exe",
+                                       r"C:\Users\test")
+            self.assertEqual(argv, ["C:/Tools/wt.exe",
+                                     "-d", r"C:\Users\test"])
+
+    def test_detect_terminal_windows(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.shutil, "which",
+                                   lambda n: n if n == "wt" else None):
+                self.assertEqual(tray.detect_terminal(), "wt")
+
+
+class WindowsClipboardTest(unittest.TestCase):
+    def test_clipboard_argv_returns_clip(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            self.assertEqual(tray.clipboard_argv(), ["clip"])
+
+    def test_copy_to_clipboard_windows(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.shutil, "which", return_value="clip"):
+                with mock.patch.object(tray.subprocess, "run") as mock_run:
+                    mock_run.return_value.returncode = 0
+                    ok, msg = tray.copy_to_clipboard("hello")
+                    self.assertTrue(ok)
+                    self.assertEqual(mock_run.call_args[0][0], ["clip"])
+
+    def test_copy_to_clipboard_windows_missing_tool(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.shutil, "which", return_value=None):
+                ok, msg = tray.copy_to_clipboard("hello")
+                self.assertFalse(ok)
+                self.assertIn("clip not found", msg)
+
+
+class WindowsConfigFileTest(unittest.TestCase):
+    def test_config_file_uses_appdata(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict(tray.os.environ,
+                                 {"APPDATA": r"C:\Users\test\AppData\Roaming"},
+                                 clear=True):
+                path = tray.config_file()
+                self.assertIn("AppData", path)
+                self.assertIn("repodash", path)
+                self.assertTrue(path.endswith("config.json"))
+
+    def test_config_file_fallback_when_no_appdata(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict(tray.os.environ, {"APPDATA": ""}, clear=True):
+                with mock.patch.object(tray.os.path, "expanduser",
+                                       return_value=r"C:\Users\test"):
+                    path = tray.config_file()
+                    self.assertIn("repodash", path)
+                    self.assertTrue(path.endswith("config.json"))
+
+
+class WindowsUrlOpenTest(unittest.TestCase):
+    def test_open_url_uses_startfile(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.os, "startfile", create=True) as mock_start:
+                ok, msg = tray.open_url("https://example.com")
+                self.assertTrue(ok)
+                mock_start.assert_called_once_with("https://example.com")
+
+    def test_open_url_startfile_error(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.os, "startfile", create=True,
+                                   side_effect=OSError("boom")):
+                ok, msg = tray.open_url("https://example.com")
+                self.assertFalse(ok)
+                self.assertIn("boom", msg)
+
+    def test_open_folder_uses_startfile(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.os, "startfile", create=True) as mock_start:
+                ok, msg = tray.open_folder(r"C:\Users\test")
+                self.assertTrue(ok)
+                mock_start.assert_called_once_with(
+                    os.path.abspath(r"C:\Users\test"))
+
+    def test_open_folder_startfile_error(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.object(tray.os, "startfile", create=True,
+                                   side_effect=OSError("boom")):
+                ok, msg = tray.open_folder(r"C:\Users\test")
+                self.assertFalse(ok)
+                self.assertIn("boom", msg)
+
+
+class FakeWinReg:
+    """Fake winreg module for testing Windows autostart functions."""
+    HKEY_CURRENT_USER = 1
+    KEY_READ = 0x20019
+    KEY_SET_VALUE = 0x0002
+    REG_SZ = 1
+
+    def __init__(self):
+        self._values = {}
+
+    def OpenKey(self, hkey, subkey, reserved=0, access=0):  # noqa: N802
+        return hkey  # dummy handle
+
+    def QueryValueEx(self, key, name):  # noqa: N802
+        if name in self._values:
+            return (self._values[name], None)
+        raise FileNotFoundError()
+
+    def SetValueEx(self, key, name, reserved, reg_type, value):  # noqa: N802
+        self._values[name] = value
+
+    def DeleteValue(self, key, name):  # noqa: N802
+        self._values.pop(name, None)
+
+    def CloseKey(self, key):  # noqa: N802
+        pass
+
+
+class WindowsAutostartTest(unittest.TestCase):
+    def setUp(self):
+        self._fake_winreg = FakeWinReg()
+
+    def test_autostart_file_returns_registry_path(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            path = tray.autostart_file()
+            self.assertEqual(
+                path,
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\repodash-tray")
+
+    def test_autostart_enabled_true_when_reg_key_exists(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": self._fake_winreg}):
+                self._fake_winreg._values["repodash-tray"] = "test"
+                self.assertTrue(tray.autostart_enabled())
+
+    def test_autostart_enabled_false_when_missing(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": self._fake_winreg}):
+                self.assertFalse(tray.autostart_enabled())
+
+    def test_autostart_enabled_registry_error(self):
+        fake_reg = FakeWinReg()
+        fake_reg.OpenKey = mock.MagicMock(side_effect=OSError("access denied"))
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": fake_reg}):
+                self.assertFalse(tray.autostart_enabled())
+
+    def test_set_autostart_enable(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": self._fake_winreg}):
+                result = tray.set_autostart(True)
+                self.assertTrue(result)
+                self.assertIn("repodash-tray", self._fake_winreg._values)
+
+    def test_set_autostart_disable(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": self._fake_winreg}):
+                self._fake_winreg._values["repodash-tray"] = "test"
+                result = tray.set_autostart(False)
+                self.assertFalse(result)
+                self.assertNotIn("repodash-tray", self._fake_winreg._values)
+
+    def test_set_autostart_disable_when_missing(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": self._fake_winreg}):
+                result = tray.set_autostart(False)
+                self.assertFalse(result)
+
+    def test_set_autostart_registry_error_swallowed(self):
+        fake_reg = FakeWinReg()
+        fake_reg.OpenKey = mock.MagicMock(side_effect=OSError("permission denied"))
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            with mock.patch.dict("sys.modules", {"winreg": fake_reg}):
+                result = tray.set_autostart(True)
+                self.assertFalse(result)
+
+    def test_autostart_contents_windows_references_win_py(self):
+        with mock.patch.object(tray.sys, "platform", "win32"):
+            contents = tray._autostart_contents()
+            self.assertIn("repodash_tray_win.py", contents)
+            self.assertIn("python", contents.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
