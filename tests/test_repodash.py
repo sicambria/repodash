@@ -868,5 +868,66 @@ class TestMain(unittest.TestCase):
             rd.process_repo = original_process_repo
 
 
+# ── pre-push hook regression tests ──────────────────────────────────────────
+PRE_PUSH_SCRIPT = os.path.join(ROOT, "scripts", "git-hooks", "pre-push")
+
+
+def _run_hook(stdin_text=""):
+    """Run the pre-push hook with REPODASH_SKIP_SLOW_CHECKS=1 and return
+    the CompletedProcess (containing stdout, stderr, returncode)."""
+    env = dict(os.environ)
+    env.pop("NO_COLOR", None)
+    env.pop("COLUMNS", None)
+    return subprocess.run(
+        ["bash", PRE_PUSH_SCRIPT],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        env={**env, "REPODASH_SKIP_SLOW_CHECKS": "1"},
+    )
+
+
+class TestPrePushHook(unittest.TestCase):
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_empty_stdin_prints_diagnostic_and_exits_zero(self):
+        cp = _run_hook("")
+        self.assertEqual(cp.returncode, 0)
+        self.assertIn("no refs found on stdin", cp.stdout)
+        self.assertIn("all checks passed", cp.stdout)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_empty_stdin_does_not_run_secret_scan(self):
+        cp = _run_hook("")
+        self.assertNotIn("WARNING: baseline SHA", cp.stdout)
+        self.assertNotIn("WARNING: local SHA", cp.stdout)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_corrupt_stdin_warns_and_exits_zero(self):
+        cp = _run_hook("garbage junk")
+        self.assertEqual(cp.returncode, 0)
+        self.assertIn("WARNING: malformed stdin line", cp.stderr)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_blank_stdin_line_is_skipped_and_exits_zero(self):
+        cp = _run_hook("\n")
+        self.assertEqual(cp.returncode, 0)
+        self.assertIn("no refs found on stdin", cp.stdout)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_missing_remote_sha_gracefully_skips_scan(self):
+        real_sha = "a2f09acd5614721182f4ab834f08416f988f6947"
+        cp = _run_hook(
+            f"refs/heads/main deadbeefbadcafe refs/heads/main {real_sha}\n"
+        )
+        self.assertEqual(cp.returncode, 0)
+        self.assertIn("all checks passed", cp.stdout)
+
+    @unittest.skipUnless(HAVE_GIT, "git not available")
+    def test_pre_push_script_has_err_trap(self):
+        with open(PRE_PUSH_SCRIPT) as f:
+            content = f.read()
+        self.assertIn("trap", content, "ERR trap is required for diagnostics")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

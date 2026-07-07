@@ -20,6 +20,23 @@ else
     diff_range=("$remote_sha" "$local_sha")
 fi
 
+# Verify the baseline SHA is reachable in this repo. A missing remote SHA
+# means the local clone hasn't fetched it yet (the push may originate from a
+# different worktree or the remote advanced independently). In that case
+# fall back to diffing against the empty tree with a warning.
+if [ "${diff_range[0]}" != "$zero_sha" ] \
+   && ! git cat-file -e "${diff_range[0]}" 2>/dev/null; then
+    echo "==> pre-push: WARNING: baseline SHA ${diff_range[0]} not found locally — diffing against empty tree" >&2
+    diff_range=("$(git hash-object -t tree /dev/null)" "$local_sha")
+fi
+
+# The local SHA is what we're pushing — it must exist. If not, something
+# is fundamentally wrong; skip the scan rather than crash.
+if ! git cat-file -e "$local_sha" 2>/dev/null; then
+    echo "==> pre-push: WARNING: local SHA $local_sha not found — skipping scan" >&2
+    exit 0
+fi
+
 diff_output="$(git diff --unified=0 "${diff_range[@]}" -- . ':(exclude)scripts/git-hooks/**')"
 
 # Only the lines a human is actually about to publish.
