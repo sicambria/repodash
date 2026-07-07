@@ -389,7 +389,7 @@ sonar_collect() {
   local mv k v
   while IFS= read -r mv; do
     k=${mv%% *}; v=${mv#* }
-    if printf '%s' "$v" | grep -qE '^-?[0-9]+$' || printf '%s' "$v" | grep -qE '^-?[0-9]*\.[0-9]+$'; then
+    if printf '%s' "$v" | grep -qE '^-?[0-9]+$' || printf '%s' "$v" | grep -qE '^-?([0-9]+\.?[0-9]*|\.[0-9]+)$'; then
       S_MK+=("$k"); S_MV+=("$v")
     fi
   done < <(printf '%s' "$body" | jq -r '.component.measures[] | "\(.metric) \(.value)"' 2>/dev/null)
@@ -437,17 +437,19 @@ repo_json() {
 
 # ── repo discovery ───────────────────────────────────────────────────────────
 discover_repos() {
-  local raw=() r k keep
+  local raw=() r last
   while IFS= read -r r; do
     raw+=("${r%/.git}")
   done < <(find "$BASE_DIR" -maxdepth "$((DEPTH + 1))" -type d -name .git 2>/dev/null | sort)
   REPOS=()
   for r in "${raw[@]}"; do
-    keep=1
-    for k in "${REPOS[@]}"; do
-      case "$r" in "$k"/*) keep=0; break ;; esac
-    done
-    [ "$keep" -eq 1 ] && REPOS+=("$r")
+    if [ "${#REPOS[@]}" -gt 0 ]; then
+      last="${REPOS[$((${#REPOS[@]} - 1))]}"
+      if [ "${r:0:${#last}}" = "$last" ] && [ "${r:${#last}:1}" = "/" ]; then
+        continue
+      fi
+    fi
+    REPOS+=("$r")
   done
 }
 

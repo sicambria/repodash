@@ -438,13 +438,37 @@ class ConfigTest(unittest.TestCase):
         finally:
             self._restore_env(saved)
 
-    def test_apply_config_zero_depth_leaves_env_untouched(self):
-        saved = self._save_env("REPODASH_DEPTH")
+    def test_apply_config_zero_depth_and_interval_clear_env(self):
+        saved = self._save_env("REPODASH_DEPTH", "REPODASH_TRAY_INTERVAL")
         os.environ["REPODASH_DEPTH"] = "5"
+        os.environ["REPODASH_TRAY_INTERVAL"] = "120"
         try:
             tray.apply_config_to_env({"base_dir": "", "depth": 0,
                                       "refresh_interval": 0, "terminal": ""})
-            self.assertEqual(os.environ.get("REPODASH_DEPTH"), "5")
+            self.assertIsNone(os.environ.get("REPODASH_DEPTH"))
+            self.assertIsNone(os.environ.get("REPODASH_TRAY_INTERVAL"))
+        finally:
+            self._restore_env(saved)
+
+    def test_apply_config_clears_base_dir_env_when_empty(self):
+        saved = self._save_env("REPODASH_DIR")
+        os.environ["REPODASH_DIR"] = "/stale/path"
+        try:
+            tray.apply_config_to_env({"base_dir": "", "depth": 0,
+                                      "refresh_interval": 0, "terminal": ""})
+            self.assertIsNone(os.environ.get("REPODASH_DIR"))
+        finally:
+            self._restore_env(saved)
+
+    def test_apply_config_sets_then_clears_base_dir(self):
+        saved = self._save_env("REPODASH_DIR")
+        try:
+            tray.apply_config_to_env({"base_dir": "/new/path", "depth": 0,
+                                      "refresh_interval": 0, "terminal": ""})
+            self.assertEqual(os.environ["REPODASH_DIR"], "/new/path")
+            tray.apply_config_to_env({"base_dir": "", "depth": 0,
+                                      "refresh_interval": 0, "terminal": ""})
+            self.assertIsNone(os.environ.get("REPODASH_DIR"))
         finally:
             self._restore_env(saved)
 
@@ -1932,6 +1956,44 @@ class RepoOpGateTest(unittest.TestCase):
             os.makedirs(os.path.join(repo, ".git", "rebase-merge"))
             self.assertEqual(tray._repo_op_gate(repo, "commit"), "needs_attention")
             self.assertEqual(tray._repo_op_gate(repo, "push"), "needs_attention")
+
+    def test_gate_needs_attention_when_repo_unreadable(self):
+        self.assertEqual(
+            tray._repo_op_gate("/no/such/repo/xyz", "commit"),
+            "needs_attention")
+
+    def test_gate_needs_attention_when_rev_parse_fails(self):
+        orig = tray._git
+        tray._git = lambda path, *args: ""
+        try:
+            self.assertEqual(
+                tray._repo_op_gate("/tmp", "commit"), "needs_attention")
+        finally:
+            tray._git = orig
+
+    def test_gate_retry_when_readable_and_dirty(self):
+        orig_run = tray.subprocess.run
+        def fake_run(argv, **kw):
+            class R:
+                returncode = 0
+                stdout = ""
+            if "rev-parse" in argv:
+                R.stdout = "/tmp/.git"
+                R.returncode = 0
+            elif "status" in argv:
+                if "--porcelain" in argv:
+                    R.stdout = "## main\n M dirty.txt\n"
+                else:
+                    R.stdout = ""
+            elif "remote" in argv:
+                R.stdout = ""
+            return R()
+        tray.subprocess.run = fake_run
+        try:
+            self.assertEqual(
+                tray._repo_op_gate("/tmp", "commit"), "retry")
+        finally:
+            tray.subprocess.run = orig_run
 
 
 class ProviderTerminalTest(unittest.TestCase):

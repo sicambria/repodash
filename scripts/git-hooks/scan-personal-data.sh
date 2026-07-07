@@ -88,7 +88,7 @@ fi
 #   *@*.anthropic.com, noreply@github  -- tool-generated trailers
 #   git@github.com / git@gitlab.com / git@bitbucket.org -- SSH remote syntax
 email_pattern='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-allowlist='@(example\.com|example\.org)|noreply@|@[a-z0-9.-]*anthropic\.com|^\+git@(github|gitlab|bitbucket)\.(com|org)'
+allowlist='@(example\.com|example\.org)|noreply@|@[a-z0-9.-]*anthropic\.com|^\+[[:space:]]*git@(github|gitlab|bitbucket)\.(com|org)'
 other_emails="$(printf '%s\n' "$added_lines" \
     | grep -E -- "$email_pattern" \
     | grep -Ev -- "$allowlist" || true)"

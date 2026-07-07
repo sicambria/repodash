@@ -273,12 +273,18 @@ def apply_config_to_env(cfg: dict) -> None:
     """
     if cfg.get("base_dir"):
         os.environ["REPODASH_DIR"] = cfg["base_dir"]
+    else:
+        os.environ.pop("REPODASH_DIR", None)
     depth = cfg.get("depth", 0)
     if depth and int(depth) > 0:
         os.environ["REPODASH_DEPTH"] = str(int(depth))
+    else:
+        os.environ.pop("REPODASH_DEPTH", None)
     interval = cfg.get("refresh_interval", 0)
     if interval and int(interval) > 0:
         os.environ["REPODASH_TRAY_INTERVAL"] = str(int(interval))
+    else:
+        os.environ.pop("REPODASH_TRAY_INTERVAL", None)
     terminal = cfg.get("terminal", "").strip()
     if terminal:
         os.environ["REPODASH_TERMINAL"] = terminal
@@ -1260,6 +1266,8 @@ def _repo_op_gate(path: str, task: str) -> str:
     "replay a finished job" — this is what makes one extra hop safe.
     """
     if _git_op_in_progress(path):
+        return "needs_attention"
+    if not _git(path, "rev-parse", "--git-dir").strip():
         return "needs_attention"
     status = git_status(path)
     if task in ("commit", "commit_and_push") and status["dirty"]:
