@@ -1912,12 +1912,12 @@ class ProviderTerminalTest(unittest.TestCase):
         self.assertEqual(seen["command"], tray.PROVIDERS["opencode"].interactive_cmd)
 
     def test_open_wt_provider_missing_binary_message_uses_bin_name(self):
-        orig = tray.shutil.which
-        tray.shutil.which = lambda _: None
+        orig = tray.resolve_tool_bin
+        tray.resolve_tool_bin = lambda _: None
         try:
             ok, msg = tray.open_wt_provider("/x", "prompt", "opencode")
         finally:
-            tray.shutil.which = orig
+            tray.resolve_tool_bin = orig
         self.assertFalse(ok)
         self.assertIn("opencode not found", msg)
 

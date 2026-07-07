@@ -964,9 +964,25 @@ _TASK_PROMPTS = {
 
 
 def resolve_tool_bin(bin_name: str) -> Optional[str]:
-    """shutil.which() for an AI CLI binary — single choke point so tests can
-    monkeypatch shutil.which and affect every provider consistently."""
-    return shutil.which(bin_name)
+    """Find an AI CLI binary — tries PATH first, then common npm global dirs.
+    Single choke point so tests can monkeypatch shutil.which and affect every
+    provider consistently."""
+    path = shutil.which(bin_name)
+    if path:
+        return path
+    candidates = []
+    nvm_bin = os.environ.get("NVM_BIN")
+    if nvm_bin:
+        candidates.append(os.path.join(nvm_bin, bin_name))
+    candidates.extend([
+        os.path.join(os.path.expanduser("~"), ".opencode", "bin", bin_name),
+        os.path.join(os.path.expanduser("~"), ".npm-global", "bin", bin_name),
+        os.path.join(os.path.expanduser("~"), ".npm", "bin", bin_name),
+    ])
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
 
 
 def _claude_build_argv(bin_path, task, mode, budget_usd, model, effort):
