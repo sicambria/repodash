@@ -1026,7 +1026,7 @@ _TASK_PROMPTS = {
 
 
 def resolve_tool_bin(bin_name: str) -> Optional[str]:
-    """Find an AI CLI binary — tries PATH first, then common npm global dirs.
+    """Find an AI CLI binary — tries PATH first, then common npm/nvm/pip global dirs.
     Single choke point so tests can monkeypatch shutil.which and affect every
     provider consistently."""
     path = shutil.which(bin_name)
@@ -1036,10 +1036,20 @@ def resolve_tool_bin(bin_name: str) -> Optional[str]:
     nvm_bin = os.environ.get("NVM_BIN")
     if nvm_bin:
         candidates.append(os.path.join(nvm_bin, bin_name))
+    nvm_root = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
+    nvm_versions = os.path.join(nvm_root, "versions", "node")
+    if os.path.isdir(nvm_versions):
+        try:
+            entries = sorted(os.listdir(nvm_versions), reverse=True)
+            for ver in entries:
+                candidates.append(os.path.join(nvm_versions, ver, "bin", bin_name))
+        except OSError:
+            pass
     candidates.extend([
         os.path.join(os.path.expanduser("~"), ".opencode", "bin", bin_name),
         os.path.join(os.path.expanduser("~"), ".npm-global", "bin", bin_name),
         os.path.join(os.path.expanduser("~"), ".npm", "bin", bin_name),
+        os.path.join(os.path.expanduser("~"), ".local", "bin", bin_name),
     ])
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
